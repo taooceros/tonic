@@ -246,6 +246,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn decode_async_decoder_returns_pending_before_message() {
+        let decoder = PendingDecoder::default();
+
+        let msg = vec![9u8; LEN];
+
+        let mut buf = BytesMut::new();
+        buf.reserve(msg.len() + HEADER_SIZE);
+        buf.put_u8(0);
+        buf.put_u32(msg.len() as u32);
+        buf.put(&msg[..]);
+
+        let body = body::MockBody::new(&buf[..], msg.len() + HEADER_SIZE, 0);
+        let mut stream = Streaming::new_request(decoder, body, None, None);
+        {
+            let mut message = pin!(stream.message());
+
+            let waker = std::task::Waker::noop();
+            let mut cx = Context::from_waker(waker);
+
+            assert!(matches!(message.as_mut().poll(&mut cx), Poll::Pending));
+
+            let output_msg = match message.as_mut().poll(&mut cx) {
+                Poll::Ready(Ok(Some(output_msg))) => output_msg,
+                Poll::Ready(Ok(None)) => panic!("message stream ended"),
+                Poll::Ready(Err(status)) => panic!("decode failed: {status}"),
+                Poll::Pending => panic!("decode remained pending"),
+            };
+
+            assert_eq!(output_msg, msg);
+        }
+        assert!(stream.message().await.expect("stream ends").is_none());
+    }
+
+    #[tokio::test]
     async fn decode_max_message_size_exceeded() {
         let decoder = MockDecoder::default();
 
@@ -341,6 +375,43 @@ mod tests {
             "0"
         );
         assert!(body.is_end_stream());
+    }
+
+    #[tokio::test]
+    async fn encode_async_encoder_returns_pending_before_data_frame() {
+        let encoder = PendingEncoder::default();
+        let msg = Vec::from(&[3u8; 32][..]);
+
+        let messages = std::iter::once(Ok::<_, Status>(msg.clone()));
+        let source = tokio_stream::iter(messages);
+
+        let mut body = pin!(EncodeBody::new_server(
+            encoder,
+            source,
+            None,
+            SingleMessageCompressionOverride::default(),
+            None,
+        ));
+
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
+
+        assert!(matches!(body.as_mut().poll_frame(&mut cx), Poll::Pending));
+
+        let frame = match body.as_mut().poll_frame(&mut cx) {
+            Poll::Ready(Some(Ok(frame))) => frame,
+            Poll::Ready(Some(Err(status))) => panic!("encode failed: {status}"),
+            Poll::Ready(None) => panic!("body ended"),
+            Poll::Pending => panic!("encode remained pending"),
+        };
+        let data = frame.into_data().expect("got data frame");
+
+        assert_eq!(data[0], 0);
+        assert_eq!(
+            u32::from_be_bytes(data[1..HEADER_SIZE].try_into().unwrap()) as usize,
+            msg.len()
+        );
+        assert_eq!(&data[HEADER_SIZE..], &msg[..]);
     }
 
     #[tokio::test]

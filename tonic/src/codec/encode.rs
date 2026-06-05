@@ -8,7 +8,7 @@ use crate::Status;
 use bytes::{BufMut, Bytes, BytesMut};
 use http::HeaderMap;
 use http_body::{Body, Frame};
-use pin_project::{pin_project, pinned_drop};
+use pin_project::pin_project;
 use std::{
     future::Future,
     marker::PhantomPinned,
@@ -18,7 +18,7 @@ use std::{
 use tokio_stream::{Stream, StreamExt, adapters::Fuse};
 
 #[doc(hidden)]
-#[pin_project(PinnedDrop)]
+#[pin_project]
 pub struct EncodedBytes<T, U>
 where
     T: Encoder<Error = Status> + 'static,
@@ -26,6 +26,8 @@ where
 {
     #[pin]
     source: Fuse<U>,
+    // Kept before `encoder` and the buffers so default field drop clears any
+    // in-flight future before dropping fields it may borrow.
     #[pin]
     encode: Option<T::EncodeFuture<'static>>,
     encoder: T,
@@ -89,18 +91,30 @@ where
             _pin: PhantomPinned,
         }
     }
+    /// # Safety
+    ///
+    /// When `encode` is `Some`, the stored future may borrow `encoder` and the
+    /// buffers. Callers must use this projection only to poll, clear, or replace
+    /// `encode`, and must not project or access borrowed fields until any
+    /// in-flight future has been cleared.
+    #[inline]
+    unsafe fn project_encode(self: Pin<&mut Self>) -> Pin<&mut Option<T::EncodeFuture<'static>>> {
+        // SAFETY: This projects only the `encode` field.
+        unsafe { self.map_unchecked_mut(|this| &mut this.encode) }
+    }
+
     #[inline]
     fn start_encoding(mut self: Pin<&mut Self>, item: T::Item) -> Result<bool, Status> {
-        let mut this = self.as_mut().project();
-        let offset = this.buf.len();
-        let compression_encoding = *this.compression_encoding;
+        let (encode_result, offset, compression_encoding) = {
+            let this = self.as_mut().project();
+            let offset = this.buf.len();
+            let compression_encoding = *this.compression_encoding;
 
-        this.buf.reserve(HEADER_SIZE);
-        unsafe {
-            this.buf.advance_mut(HEADER_SIZE);
-        }
+            this.buf.reserve(HEADER_SIZE);
+            unsafe {
+                this.buf.advance_mut(HEADER_SIZE);
+            }
 
-        let result = {
             let result = if compression_encoding.is_some() {
                 this.uncompression_buf.clear();
                 let dst = EncodeBuf::new(this.uncompression_buf);
@@ -110,8 +124,8 @@ where
                 this.encoder.encode_result(item, dst)
             };
 
-            match result {
-                EncodeResult::Ready(result) => result,
+            let result = match result {
+                EncodeResult::Ready(result) => EncodeResult::Ready(result),
                 EncodeResult::Future(future) => {
                     *this.in_flight = Some(InFlightEncode {
                         offset,
@@ -119,34 +133,54 @@ where
                     });
                     // SAFETY: see `extend_encode_future_lifetime`.
                     let future = unsafe { extend_encode_future_lifetime::<T>(future) };
-                    this.encode.set(Some(future));
-                    return Ok(false);
+                    EncodeResult::Future(future)
                 }
-            }
+            };
+
+            (result, offset, compression_encoding)
         };
 
-        result.map_err(|err| Status::internal(format!("Error encoding: {err}")))?;
-        finish_encoded_item(
-            this.buf,
-            this.uncompression_buf,
-            *this.buffer_settings,
-            *this.max_message_size,
-            offset,
-            compression_encoding,
-        )?;
-        Ok(true)
+        match encode_result {
+            EncodeResult::Ready(result) => {
+                result.map_err(|err| Status::internal(format!("Error encoding: {err}")))?;
+
+                let this = self.as_mut().project();
+                finish_encoded_item(
+                    this.buf,
+                    this.uncompression_buf,
+                    *this.buffer_settings,
+                    *this.max_message_size,
+                    offset,
+                    compression_encoding,
+                )?;
+                Ok(true)
+            }
+            EncodeResult::Future(future) => {
+                // SAFETY: `encode` is currently empty; after storing the
+                // future we return without touching fields it may borrow.
+                unsafe { self.as_mut().project_encode() }.set(Some(future));
+                Ok(false)
+            }
+        }
     }
 
     #[inline]
     fn poll_encode(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Status>> {
-        let mut this = self.as_mut().project();
-        let Some(future) = this.encode.as_mut().as_pin_mut() else {
-            return Poll::Ready(Ok(()));
+        let result = {
+            // SAFETY: only the in-flight encode future is projected and
+            // polled; no borrowed fields are accessed while it is live.
+            let mut encode = unsafe { self.as_mut().project_encode() };
+            let Some(future) = encode.as_mut().as_pin_mut() else {
+                return Poll::Ready(Ok(()));
+            };
+
+            ready!(future.poll(cx))
         };
 
-        let result = ready!(future.poll(cx));
-        this.encode.set(None);
+        // SAFETY: clear the completed future before projecting borrowed fields.
+        unsafe { self.as_mut().project_encode() }.set(None);
 
+        let this = self.as_mut().project();
         let InFlightEncode {
             offset,
             compression_encoding,
@@ -215,21 +249,10 @@ where
     T: Encoder<Error = Status> + 'static,
 {
     // SAFETY: `EncodedBytes` stores the future together with the encoder and
-    // buffer it borrows. The type is !Unpin, the future is always dropped in
-    // `PinnedDrop` before those fields, and no method moves or mutates the
-    // borrowed fields while `encode` is `Some`.
+    // buffer it borrows. The type is !Unpin, `encode` is declared before the
+    // borrowed fields so default field drop clears it first, and `poll_encode`
+    // clears the future before projecting or otherwise accessing those fields.
     unsafe { std::mem::transmute::<T::EncodeFuture<'a>, T::EncodeFuture<'static>>(future) }
-}
-
-#[pinned_drop]
-impl<T, U> PinnedDrop for EncodedBytes<T, U>
-where
-    T: Encoder<Error = Status> + 'static,
-    U: Stream<Item = Result<T::Item, Status>>,
-{
-    fn drop(self: Pin<&mut Self>) {
-        self.project().encode.set(None);
-    }
 }
 
 impl<T, U> Stream for EncodedBytes<T, U>
@@ -242,14 +265,12 @@ where
     #[inline]
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         loop {
-            if self.as_ref().project_ref().encode.get_ref().is_some() {
-                if let Err(status) = ready!(self.as_mut().poll_encode(cx)) {
-                    return Poll::Ready(Some(Err(status)));
-                }
+            if let Err(status) = ready!(self.as_mut().poll_encode(cx)) {
+                return Poll::Ready(Some(Err(status)));
+            }
 
-                if let Some(bytes) = self.as_mut().take_buf_if_over_threshold() {
-                    return Poll::Ready(Some(Ok(bytes)));
-                }
+            if let Some(bytes) = self.as_mut().take_buf_if_over_threshold() {
+                return Poll::Ready(Some(Ok(bytes)));
             }
 
             if let Some(status) = self.as_mut().project().error.take() {
