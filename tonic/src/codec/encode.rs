@@ -17,27 +17,6 @@ use std::{
 };
 use tokio_stream::{Stream, StreamExt, adapters::Fuse};
 
-#[inline]
-fn encoded_bytes<T, U>(
-    encoder: T,
-    source: U,
-    compression_encoding: Option<CompressionEncoding>,
-    compression_override: SingleMessageCompressionOverride,
-    max_message_size: Option<usize>,
-) -> EncodedBytes<T, U>
-where
-    T: Encoder<Error = Status> + 'static,
-    U: Stream<Item = Result<T::Item, Status>>,
-{
-    EncodedBytes::new(
-        encoder,
-        source,
-        compression_encoding,
-        compression_override,
-        max_message_size,
-    )
-}
-
 #[doc(hidden)]
 #[pin_project(PinnedDrop)]
 pub struct EncodedBytes<T, U>
@@ -52,21 +31,19 @@ where
     encoder: T,
     compression_encoding: Option<CompressionEncoding>,
     max_message_size: Option<usize>,
+    buffer_settings: BufferSettings,
     buf: BytesMut,
     uncompression_buf: BytesMut,
-    state: EncodedBytesState,
+    in_flight: Option<InFlightEncode>,
     error: Option<Status>,
     #[pin]
     _pin: PhantomPinned,
 }
 
 #[derive(Debug)]
-enum EncodedBytesState {
-    Idle,
-    Encoding {
-        offset: usize,
-        compression_encoding: Option<CompressionEncoding>,
-    },
+struct InFlightEncode {
+    offset: usize,
+    compression_encoding: Option<CompressionEncoding>,
 }
 
 impl<T, U> EncodedBytes<T, U>
@@ -104,15 +81,16 @@ where
             encoder,
             compression_encoding,
             max_message_size,
+            buffer_settings,
             buf,
             uncompression_buf,
-            state: EncodedBytesState::Idle,
+            in_flight: None,
             error: None,
             _pin: PhantomPinned,
         }
     }
     #[inline]
-    fn start_encoding(mut self: Pin<&mut Self>, item: T::Item) -> Option<Result<(), Status>> {
+    fn start_encoding(mut self: Pin<&mut Self>, item: T::Item) -> Result<bool, Status> {
         let mut this = self.as_mut().project();
         let offset = this.buf.len();
         let compression_encoding = *this.compression_encoding;
@@ -135,33 +113,28 @@ where
             match result {
                 EncodeResult::Ready(result) => result,
                 EncodeResult::Future(future) => {
-                    *this.state = EncodedBytesState::Encoding {
+                    *this.in_flight = Some(InFlightEncode {
                         offset,
                         compression_encoding,
-                    };
+                    });
                     // SAFETY: see `extend_encode_future_lifetime`.
                     let future = unsafe { extend_encode_future_lifetime::<T>(future) };
                     this.encode.set(Some(future));
-                    return None;
+                    return Ok(false);
                 }
             }
         };
 
-        let buffer_settings = this.encoder.buffer_settings();
-        Some(
-            result
-                .map_err(|err| Status::internal(format!("Error encoding: {err}")))
-                .and_then(|()| {
-                    finish_encoded_item(
-                        this.buf,
-                        this.uncompression_buf,
-                        buffer_settings,
-                        *this.max_message_size,
-                        offset,
-                        compression_encoding,
-                    )
-                }),
-        )
+        result.map_err(|err| Status::internal(format!("Error encoding: {err}")))?;
+        finish_encoded_item(
+            this.buf,
+            this.uncompression_buf,
+            *this.buffer_settings,
+            *this.max_message_size,
+            offset,
+            compression_encoding,
+        )?;
+        Ok(true)
     }
 
     #[inline]
@@ -174,26 +147,36 @@ where
         let result = ready!(future.poll(cx));
         this.encode.set(None);
 
-        let EncodedBytesState::Encoding {
+        let InFlightEncode {
             offset,
             compression_encoding,
-        } = std::mem::replace(this.state, EncodedBytesState::Idle)
-        else {
-            unreachable!("encode future must have encode state");
-        };
+        } = this
+            .in_flight
+            .take()
+            .expect("encode future must have in-flight state");
 
         result.map_err(|err| Status::internal(format!("Error encoding: {err}")))?;
 
         finish_encoded_item(
             this.buf,
             this.uncompression_buf,
-            this.encoder.buffer_settings(),
+            *this.buffer_settings,
             *this.max_message_size,
             offset,
             compression_encoding,
         )?;
 
         Poll::Ready(Ok(()))
+    }
+
+    #[inline]
+    fn take_buf_if_over_threshold(mut self: Pin<&mut Self>) -> Option<Bytes> {
+        let this = self.as_mut().project();
+        if this.buf.len() >= this.buffer_settings.yield_threshold {
+            Some(take_buf(this.buf))
+        } else {
+            None
+        }
     }
 }
 
@@ -264,16 +247,7 @@ where
                     return Poll::Ready(Some(Err(status)));
                 }
 
-                let should_yield = {
-                    let this = self.as_mut().project();
-                    this.buf.len() >= this.encoder.buffer_settings().yield_threshold
-                };
-
-                if should_yield {
-                    let bytes = {
-                        let this = self.as_mut().project();
-                        take_buf(this.buf)
-                    };
+                if let Some(bytes) = self.as_mut().take_buf_if_over_threshold() {
                     return Poll::Ready(Some(Ok(bytes)));
                 }
             }
@@ -302,23 +276,14 @@ where
                 }
             };
 
-            if let Some(result) = self.as_mut().start_encoding(item) {
-                if let Err(status) = result {
-                    return Poll::Ready(Some(Err(status)));
+            match self.as_mut().start_encoding(item) {
+                Ok(true) => {
+                    if let Some(bytes) = self.as_mut().take_buf_if_over_threshold() {
+                        return Poll::Ready(Some(Ok(bytes)));
+                    }
                 }
-
-                let should_yield = {
-                    let this = self.as_mut().project();
-                    this.buf.len() >= this.encoder.buffer_settings().yield_threshold
-                };
-
-                if should_yield {
-                    let bytes = {
-                        let this = self.as_mut().project();
-                        take_buf(this.buf)
-                    };
-                    return Poll::Ready(Some(Ok(bytes)));
-                }
+                Ok(false) => {}
+                Err(status) => return Poll::Ready(Some(Err(status))),
             }
         }
     }
@@ -404,7 +369,7 @@ impl EncodeBody<()> {
         U: Stream<Item = Result<T::Item, Status>>,
     {
         EncodeBody {
-            inner: encoded_bytes(
+            inner: EncodedBytes::new(
                 encoder,
                 source,
                 compression_encoding,
@@ -434,7 +399,7 @@ impl EncodeBody<()> {
         U: Stream<Item = Result<T::Item, Status>>,
     {
         EncodeBody {
-            inner: encoded_bytes(
+            inner: EncodedBytes::new(
                 encoder,
                 source,
                 compression_encoding,
