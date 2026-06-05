@@ -26,7 +26,7 @@ use bytes::{Buf, BufMut};
 use std::marker::PhantomData;
 use tonic::{
     Status,
-    codec::{Codec, DecodeBuf, Decoder, EncodeBuf, Encoder},
+    codec::{Codec, DecodeBuf, Decoder, EncodeBuf, EncodeResult, Encoder},
 };
 
 pub use protobuf;
@@ -101,6 +101,22 @@ impl<T: Message> Encoder for ProtoEncoder<T> {
             .map_err(from_decode_error)
             .map(|serialized| buf.put_slice(serialized.as_slice()));
         std::future::ready(result)
+    }
+
+    fn encode_result<'a>(
+        &'a mut self,
+        item: Self::Item,
+        mut buf: EncodeBuf<'a>,
+    ) -> EncodeResult<Self::EncodeFuture<'a>, Self::Error> {
+        // The protobuf library doesn't support serializing into a user-provided
+        // buffer. Instead, it allocates its own buffer, resulting in an extra
+        // copy and allocation.
+        // TODO: #2345 - Find a way to avoid this extra copy.
+        let result = item
+            .serialize()
+            .map_err(from_decode_error)
+            .map(|serialized| buf.put_slice(serialized.as_slice()));
+        EncodeResult::Ready(result)
     }
 }
 

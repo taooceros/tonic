@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::marker::PhantomData;
 use tonic::{
     Status,
-    codec::{Codec, DecodeBuf, Decoder, EncodeBuf, Encoder},
+    codec::{Codec, DecodeBuf, Decoder, EncodeBuf, EncodeResult, Encoder},
 };
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -34,6 +34,16 @@ impl<T: serde::Serialize> Encoder for JsonEncoder<T> {
 
     fn encode<'a>(&'a mut self, item: Self::Item, buf: EncodeBuf<'a>) -> Self::EncodeFuture<'a> {
         std::future::ready(
+            serde_json::to_writer(buf.writer(), &item).map_err(|e| Status::internal(e.to_string())),
+        )
+    }
+
+    fn encode_result<'a>(
+        &'a mut self,
+        item: Self::Item,
+        buf: EncodeBuf<'a>,
+    ) -> EncodeResult<Self::EncodeFuture<'a>, Self::Error> {
+        EncodeResult::Ready(
             serde_json::to_writer(buf.writer(), &item).map_err(|e| Status::internal(e.to_string())),
         )
     }

@@ -12,7 +12,7 @@ use std::{future::Future, io};
 pub use self::buffer::{DecodeBuf, EncodeBuf};
 pub use self::compression::{CompressionEncoding, EnabledCompressionEncodings};
 pub use self::decode::Streaming;
-pub use self::encode::EncodeBody;
+pub use self::encode::{EncodeBody, EncodedBytes};
 
 // Doc hidden since this is used in a test in another crate, we can expose this publically later
 // if we need it.
@@ -119,6 +119,16 @@ pub trait Codec {
     fn decoder(&mut self) -> Self::Decoder;
 }
 
+/// Result of starting an encode operation.
+#[derive(Debug)]
+#[doc(hidden)]
+pub enum EncodeResult<F, E> {
+    /// Encoding completed immediately.
+    Ready(Result<(), E>),
+    /// Encoding must be polled to completion.
+    Future(F),
+}
+
 /// Encodes gRPC message types
 pub trait Encoder {
     /// The type that is encoded.
@@ -136,6 +146,17 @@ pub trait Encoder {
 
     /// Encodes a message into the provided buffer.
     fn encode<'a>(&'a mut self, item: Self::Item, dst: EncodeBuf<'a>) -> Self::EncodeFuture<'a>;
+
+    /// Encodes a message immediately when possible, otherwise returns a future.
+    #[inline]
+    #[doc(hidden)]
+    fn encode_result<'a>(
+        &'a mut self,
+        item: Self::Item,
+        dst: EncodeBuf<'a>,
+    ) -> EncodeResult<Self::EncodeFuture<'a>, Self::Error> {
+        EncodeResult::Future(self.encode(item, dst))
+    }
 
     /// Controls how tonic creates and expands encode buffers.
     fn buffer_settings(&self) -> BufferSettings {

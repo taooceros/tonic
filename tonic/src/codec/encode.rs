@@ -1,33 +1,89 @@
 use super::compression::{
     CompressionEncoding, CompressionSettings, SingleMessageCompressionOverride, compress,
 };
-use super::{BufferSettings, DEFAULT_MAX_SEND_MESSAGE_SIZE, EncodeBuf, Encoder, HEADER_SIZE};
+use super::{
+    BufferSettings, DEFAULT_MAX_SEND_MESSAGE_SIZE, EncodeBuf, EncodeResult, Encoder, HEADER_SIZE,
+};
 use crate::Status;
 use bytes::{BufMut, Bytes, BytesMut};
 use http::HeaderMap;
 use http_body::{Body, Frame};
-use pin_project::pin_project;
+use pin_project::{pin_project, pinned_drop};
 use std::{
-    future::poll_fn,
+    future::Future,
+    marker::PhantomPinned,
     pin::Pin,
     task::{Context, Poll, ready},
 };
-use tokio_stream::{Stream, StreamExt};
+use tokio_stream::{Stream, StreamExt, adapters::Fuse};
 
+#[inline]
 fn encoded_bytes<T, U>(
-    mut encoder: T,
+    encoder: T,
     source: U,
     compression_encoding: Option<CompressionEncoding>,
     compression_override: SingleMessageCompressionOverride,
     max_message_size: Option<usize>,
-) -> impl Stream<Item = Result<Bytes, Status>>
+) -> EncodedBytes<T, U>
 where
-    T: Encoder<Error = Status>,
+    T: Encoder<Error = Status> + 'static,
     U: Stream<Item = Result<T::Item, Status>>,
 {
-    async_stream::stream! {
+    EncodedBytes::new(
+        encoder,
+        source,
+        compression_encoding,
+        compression_override,
+        max_message_size,
+    )
+}
+
+#[doc(hidden)]
+#[pin_project(PinnedDrop)]
+pub struct EncodedBytes<T, U>
+where
+    T: Encoder<Error = Status> + 'static,
+    U: Stream<Item = Result<T::Item, Status>>,
+{
+    #[pin]
+    source: Fuse<U>,
+    #[pin]
+    encode: Option<T::EncodeFuture<'static>>,
+    encoder: T,
+    compression_encoding: Option<CompressionEncoding>,
+    max_message_size: Option<usize>,
+    buf: BytesMut,
+    uncompression_buf: BytesMut,
+    state: EncodedBytesState,
+    error: Option<Status>,
+    #[pin]
+    _pin: PhantomPinned,
+}
+
+#[derive(Debug)]
+enum EncodedBytesState {
+    Idle,
+    Encoding {
+        offset: usize,
+        compression_encoding: Option<CompressionEncoding>,
+    },
+}
+
+impl<T, U> EncodedBytes<T, U>
+where
+    T: Encoder<Error = Status> + 'static,
+    U: Stream<Item = Result<T::Item, Status>>,
+{
+    #[inline]
+    fn new(
+        encoder: T,
+        source: U,
+        compression_encoding: Option<CompressionEncoding>,
+        compression_override: SingleMessageCompressionOverride,
+        max_message_size: Option<usize>,
+    ) -> Self {
         let buffer_settings = encoder.buffer_settings();
-        let mut buf = BytesMut::with_capacity(buffer_settings.buffer_size);
+        let buf = BytesMut::with_capacity(buffer_settings.buffer_size);
 
         let compression_encoding =
             if compression_override == SingleMessageCompressionOverride::Disable {
@@ -36,95 +92,121 @@ where
                 compression_encoding
             };
 
-        let mut uncompression_buf = if compression_encoding.is_some() {
+        let uncompression_buf = if compression_encoding.is_some() {
             BytesMut::with_capacity(buffer_settings.buffer_size)
         } else {
             BytesMut::new()
         };
 
-        let source = source.fuse();
-        let mut source = std::pin::pin!(source);
+        EncodedBytes {
+            source: source.fuse(),
+            encode: None,
+            encoder,
+            compression_encoding,
+            max_message_size,
+            buf,
+            uncompression_buf,
+            state: EncodedBytesState::Idle,
+            error: None,
+            _pin: PhantomPinned,
+        }
+    }
+    #[inline]
+    fn start_encoding(mut self: Pin<&mut Self>, item: T::Item) -> Option<Result<(), Status>> {
+        let mut this = self.as_mut().project();
+        let offset = this.buf.len();
+        let compression_encoding = *this.compression_encoding;
 
-        loop {
-            let source_poll = poll_fn(|cx| match source.as_mut().poll_next(cx) {
-                Poll::Pending if buf.is_empty() => Poll::Pending,
-                poll => Poll::Ready(poll),
-            })
-            .await;
+        this.buf.reserve(HEADER_SIZE);
+        unsafe {
+            this.buf.advance_mut(HEADER_SIZE);
+        }
 
-            match source_poll {
-                Poll::Pending => yield Ok(take_buf(&mut buf)),
-                Poll::Ready(None) => {
-                    if !buf.is_empty() {
-                        yield Ok(take_buf(&mut buf));
-                    }
-                    return;
-                }
-                Poll::Ready(Some(Ok(item))) => {
-                    if let Err(status) = encode_item(
-                        &mut encoder,
-                        &mut buf,
-                        &mut uncompression_buf,
+        let result = {
+            let result = if compression_encoding.is_some() {
+                this.uncompression_buf.clear();
+                let dst = EncodeBuf::new(this.uncompression_buf);
+                this.encoder.encode_result(item, dst)
+            } else {
+                let dst = EncodeBuf::new(this.buf);
+                this.encoder.encode_result(item, dst)
+            };
+
+            match result {
+                EncodeResult::Ready(result) => result,
+                EncodeResult::Future(future) => {
+                    *this.state = EncodedBytesState::Encoding {
+                        offset,
                         compression_encoding,
-                        max_message_size,
-                        buffer_settings,
-                        item,
-                    )
-                    .await
-                    {
-                        yield Err(status);
-                        continue;
-                    }
-
-                    if buf.len() >= buffer_settings.yield_threshold {
-                        yield Ok(take_buf(&mut buf));
-                    }
-                }
-                Poll::Ready(Some(Err(status))) => {
-                    if !buf.is_empty() {
-                        yield Ok(take_buf(&mut buf));
-                    }
-                    yield Err(status);
+                    };
+                    // SAFETY: see `extend_encode_future_lifetime`.
+                    let future = unsafe { extend_encode_future_lifetime::<T>(future) };
+                    this.encode.set(Some(future));
+                    return None;
                 }
             }
-        }
+        };
+
+        let buffer_settings = this.encoder.buffer_settings();
+        Some(
+            result
+                .map_err(|err| Status::internal(format!("Error encoding: {err}")))
+                .and_then(|()| {
+                    finish_encoded_item(
+                        this.buf,
+                        this.uncompression_buf,
+                        buffer_settings,
+                        *this.max_message_size,
+                        offset,
+                        compression_encoding,
+                    )
+                }),
+        )
+    }
+
+    #[inline]
+    fn poll_encode(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Status>> {
+        let mut this = self.as_mut().project();
+        let Some(future) = this.encode.as_mut().as_pin_mut() else {
+            return Poll::Ready(Ok(()));
+        };
+
+        let result = ready!(future.poll(cx));
+        this.encode.set(None);
+
+        let EncodedBytesState::Encoding {
+            offset,
+            compression_encoding,
+        } = std::mem::replace(this.state, EncodedBytesState::Idle)
+        else {
+            unreachable!("encode future must have encode state");
+        };
+
+        result.map_err(|err| Status::internal(format!("Error encoding: {err}")))?;
+
+        finish_encoded_item(
+            this.buf,
+            this.uncompression_buf,
+            this.encoder.buffer_settings(),
+            *this.max_message_size,
+            offset,
+            compression_encoding,
+        )?;
+
+        Poll::Ready(Ok(()))
     }
 }
 
-fn take_buf(buf: &mut BytesMut) -> Bytes {
-    buf.split_to(buf.len()).freeze()
-}
-
-async fn encode_item<T>(
-    encoder: &mut T,
+#[inline]
+fn finish_encoded_item(
     buf: &mut BytesMut,
     uncompression_buf: &mut BytesMut,
-    compression_encoding: Option<CompressionEncoding>,
-    max_message_size: Option<usize>,
     buffer_settings: BufferSettings,
-    item: T::Item,
-) -> Result<(), Status>
-where
-    T: Encoder<Error = Status>,
-{
-    let offset = buf.len();
-
-    buf.reserve(HEADER_SIZE);
-    unsafe {
-        buf.advance_mut(HEADER_SIZE);
-    }
-
+    max_message_size: Option<usize>,
+    offset: usize,
+    compression_encoding: Option<CompressionEncoding>,
+) -> Result<(), Status> {
     if let Some(encoding) = compression_encoding {
-        uncompression_buf.clear();
-
-        {
-            let dst = EncodeBuf::new(uncompression_buf);
-            encoder
-                .encode(item, dst)
-                .await
-                .map_err(|err| Status::internal(format!("Error encoding: {err}")))?;
-        }
-
         let uncompressed_len = uncompression_buf.len();
 
         compress(
@@ -137,18 +219,127 @@ where
             uncompressed_len,
         )
         .map_err(|err| Status::internal(format!("Error compressing: {err}")))?;
-    } else {
-        let dst = EncodeBuf::new(buf);
-        encoder
-            .encode(item, dst)
-            .await
-            .map_err(|err| Status::internal(format!("Error encoding: {err}")))?;
     }
 
     // now that we know length, we can write the header
     finish_encoding(compression_encoding, max_message_size, &mut buf[offset..])
 }
 
+unsafe fn extend_encode_future_lifetime<'a, T>(
+    future: T::EncodeFuture<'a>,
+) -> T::EncodeFuture<'static>
+where
+    T: Encoder<Error = Status> + 'static,
+{
+    // SAFETY: `EncodedBytes` stores the future together with the encoder and
+    // buffer it borrows. The type is !Unpin, the future is always dropped in
+    // `PinnedDrop` before those fields, and no method moves or mutates the
+    // borrowed fields while `encode` is `Some`.
+    unsafe { std::mem::transmute::<T::EncodeFuture<'a>, T::EncodeFuture<'static>>(future) }
+}
+
+#[pinned_drop]
+impl<T, U> PinnedDrop for EncodedBytes<T, U>
+where
+    T: Encoder<Error = Status> + 'static,
+    U: Stream<Item = Result<T::Item, Status>>,
+{
+    fn drop(self: Pin<&mut Self>) {
+        self.project().encode.set(None);
+    }
+}
+
+impl<T, U> Stream for EncodedBytes<T, U>
+where
+    T: Encoder<Error = Status> + 'static,
+    U: Stream<Item = Result<T::Item, Status>>,
+{
+    type Item = Result<Bytes, Status>;
+
+    #[inline]
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        loop {
+            if self.as_ref().project_ref().encode.get_ref().is_some() {
+                if let Err(status) = ready!(self.as_mut().poll_encode(cx)) {
+                    return Poll::Ready(Some(Err(status)));
+                }
+
+                let should_yield = {
+                    let this = self.as_mut().project();
+                    this.buf.len() >= this.encoder.buffer_settings().yield_threshold
+                };
+
+                if should_yield {
+                    let bytes = {
+                        let this = self.as_mut().project();
+                        take_buf(this.buf)
+                    };
+                    return Poll::Ready(Some(Ok(bytes)));
+                }
+            }
+
+            if let Some(status) = self.as_mut().project().error.take() {
+                return Poll::Ready(Some(Err(status)));
+            }
+
+            let item = {
+                let mut this = self.as_mut().project();
+                match this.source.as_mut().poll_next(cx) {
+                    Poll::Pending if this.buf.is_empty() => return Poll::Pending,
+                    Poll::Ready(None) if this.buf.is_empty() => return Poll::Ready(None),
+                    Poll::Pending | Poll::Ready(None) => {
+                        return Poll::Ready(Some(Ok(take_buf(this.buf))));
+                    }
+                    Poll::Ready(Some(Ok(item))) => item,
+                    Poll::Ready(Some(Err(status))) => {
+                        if this.buf.is_empty() {
+                            return Poll::Ready(Some(Err(status)));
+                        }
+
+                        *this.error = Some(status);
+                        return Poll::Ready(Some(Ok(take_buf(this.buf))));
+                    }
+                }
+            };
+
+            if let Some(result) = self.as_mut().start_encoding(item) {
+                if let Err(status) = result {
+                    return Poll::Ready(Some(Err(status)));
+                }
+
+                let should_yield = {
+                    let this = self.as_mut().project();
+                    this.buf.len() >= this.encoder.buffer_settings().yield_threshold
+                };
+
+                if should_yield {
+                    let bytes = {
+                        let this = self.as_mut().project();
+                        take_buf(this.buf)
+                    };
+                    return Poll::Ready(Some(Ok(bytes)));
+                }
+            }
+        }
+    }
+}
+
+impl<T, U> std::fmt::Debug for EncodedBytes<T, U>
+where
+    T: Encoder<Error = Status> + 'static,
+    U: Stream<Item = Result<T::Item, Status>>,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EncodedBytes").finish()
+    }
+}
+
+#[inline]
+fn take_buf(buf: &mut BytesMut) -> Bytes {
+    buf.split_to(buf.len()).freeze()
+}
+
+#[inline]
 fn finish_encoding(
     compression_encoding: Option<CompressionEncoding>,
     max_message_size: Option<usize>,
@@ -201,14 +392,15 @@ struct EncodeState {
 impl EncodeBody<()> {
     /// Turns a stream of grpc messages into [EncodeBody] which is used by grpc clients for
     /// turning the messages into http frames for sending over the network.
+    #[inline]
     pub fn new_client<T, U>(
         encoder: T,
         source: U,
         compression_encoding: Option<CompressionEncoding>,
         max_message_size: Option<usize>,
-    ) -> EncodeBody<impl Stream<Item = Result<Bytes, Status>>>
+    ) -> EncodeBody<EncodedBytes<T, U>>
     where
-        T: Encoder<Error = Status>,
+        T: Encoder<Error = Status> + 'static,
         U: Stream<Item = Result<T::Item, Status>>,
     {
         EncodeBody {
@@ -229,15 +421,16 @@ impl EncodeBody<()> {
 
     /// Turns a stream of grpc results (message or error status) into [EncodeBody] which is used by grpc
     /// servers for turning the messages into http frames for sending over the network.
+    #[inline]
     pub fn new_server<T, U>(
         encoder: T,
         source: U,
         compression_encoding: Option<CompressionEncoding>,
         compression_override: SingleMessageCompressionOverride,
         max_message_size: Option<usize>,
-    ) -> EncodeBody<impl Stream<Item = Result<Bytes, Status>>>
+    ) -> EncodeBody<EncodedBytes<T, U>>
     where
-        T: Encoder<Error = Status>,
+        T: Encoder<Error = Status> + 'static,
         U: Stream<Item = Result<T::Item, Status>>,
     {
         EncodeBody {
@@ -258,6 +451,7 @@ impl EncodeBody<()> {
 }
 
 impl EncodeState {
+    #[inline]
     fn trailers(&mut self) -> Option<Result<HeaderMap, Status>> {
         match self.role {
             Role::Client => None,
@@ -285,10 +479,12 @@ where
     type Data = Bytes;
     type Error = Status;
 
+    #[inline]
     fn is_end_stream(&self) -> bool {
         self.state.is_end_stream
     }
 
+    #[inline]
     fn poll_frame(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,

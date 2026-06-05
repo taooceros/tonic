@@ -1,7 +1,7 @@
 use prost::Message;
 use std::marker::PhantomData;
 use tonic::Status;
-use tonic::codec::{BufferSettings, Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
+use tonic::codec::{BufferSettings, Codec, DecodeBuf, Decoder, EncodeBuf, EncodeResult, Encoder};
 
 /// A [`Codec`] that implements `application/grpc+proto` via the prost library.
 #[derive(Debug, Clone)]
@@ -99,6 +99,7 @@ impl<T: Message> Encoder for ProstEncoder<T> {
     where
         Self: 'a;
 
+    #[inline]
     fn encode<'a>(
         &'a mut self,
         item: Self::Item,
@@ -110,6 +111,19 @@ impl<T: Message> Encoder for ProstEncoder<T> {
         std::future::ready(Ok(()))
     }
 
+    #[inline]
+    fn encode_result<'a>(
+        &'a mut self,
+        item: Self::Item,
+        mut buf: EncodeBuf<'a>,
+    ) -> EncodeResult<Self::EncodeFuture<'a>, Self::Error> {
+        item.encode(&mut buf)
+            .expect("Message only errors if not enough space");
+
+        EncodeResult::Ready(Ok(()))
+    }
+
+    #[inline]
     fn buffer_settings(&self) -> BufferSettings {
         self.buffer_settings
     }
