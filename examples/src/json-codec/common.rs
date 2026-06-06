@@ -4,10 +4,13 @@
 
 use bytes::{Buf, BufMut};
 use serde::{Deserialize, Serialize};
-use std::marker::PhantomData;
+use std::{
+    marker::PhantomData,
+    task::{Context, Poll},
+};
 use tonic::{
     Status,
-    codec::{Codec, DecodeBuf, Decoder, EncodeBuf, EncodeResult, Encoder},
+    codec::{Codec, DecodeBuf, Decoder, EncodeBuf, Encoder},
 };
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -27,23 +30,20 @@ impl<T: serde::Serialize> Encoder for JsonEncoder<T> {
     type Item = T;
     type Error = Status;
 
-    type EncodeFuture<'a>
-        = std::future::Ready<Result<(), Self::Error>>
-    where
-        Self: 'a;
+    const ENCODE_READY: bool = true;
 
-    fn encode<'a>(&'a mut self, item: Self::Item, buf: EncodeBuf<'a>) -> Self::EncodeFuture<'a> {
-        std::future::ready(
-            serde_json::to_writer(buf.writer(), &item).map_err(|e| Status::internal(e.to_string())),
-        )
+    fn encode_ready(&mut self, item: Self::Item, buf: EncodeBuf<'_>) -> Result<(), Self::Error> {
+        serde_json::to_writer(buf.writer(), &item).map_err(|e| Status::internal(e.to_string()))
     }
 
-    fn encode_result<'a>(
-        &'a mut self,
-        item: Self::Item,
-        buf: EncodeBuf<'a>,
-    ) -> EncodeResult<Self::EncodeFuture<'a>, Self::Error> {
-        EncodeResult::Ready(
+    fn poll_encode(
+        &mut self,
+        _cx: &mut Context<'_>,
+        item: &mut Option<Self::Item>,
+        buf: EncodeBuf<'_>,
+    ) -> Poll<Result<(), Self::Error>> {
+        let item = item.take().expect("encoder item available");
+        Poll::Ready(
             serde_json::to_writer(buf.writer(), &item).map_err(|e| Status::internal(e.to_string())),
         )
     }
@@ -56,20 +56,19 @@ impl<U: serde::de::DeserializeOwned + Send> Decoder for JsonDecoder<U> {
     type Item = U;
     type Error = Status;
 
-    type DecodeFuture<'a>
-        = std::future::Ready<Result<Option<Self::Item>, Self::Error>>
-    where
-        Self: 'a;
-
-    fn decode<'a>(&'a mut self, buf: DecodeBuf<'a>) -> Self::DecodeFuture<'a> {
+    fn poll_decode(
+        &mut self,
+        _cx: &mut Context<'_>,
+        buf: DecodeBuf<'_>,
+    ) -> Poll<Result<Option<Self::Item>, Self::Error>> {
         if !buf.has_remaining() {
-            return std::future::ready(Ok(None));
+            return Poll::Ready(Ok(None));
         }
 
         let item = serde_json::from_reader(buf.reader())
             .map(Some)
             .map_err(|e| Status::internal(e.to_string()));
-        std::future::ready(item)
+        Poll::Ready(item)
     }
 }
 

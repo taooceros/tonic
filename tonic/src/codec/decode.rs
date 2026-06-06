@@ -5,11 +5,10 @@ use bytes::{Buf, BufMut, BytesMut};
 use http::{HeaderMap, StatusCode};
 use http_body::Body as HttpBody;
 use http_body_util::BodyExt;
-use pin_project::{pin_project, pinned_drop};
+use pin_project::pin_project;
 use std::{
-    fmt,
-    future::{self, Future},
-    marker::{PhantomData, PhantomPinned},
+    fmt, future,
+    marker::PhantomData,
     pin::Pin,
     task::{Context, Poll, ready},
 };
@@ -49,8 +48,11 @@ enum State {
         compression: Option<CompressionEncoding>,
         len: usize,
     },
+    Decode {
+        decompressed: bool,
+        len: usize,
+    },
 }
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Direction {
     Request,
@@ -65,14 +67,12 @@ pub enum StreamingEvent<T> {
     Trailers(HeaderMap),
 }
 
-#[pin_project(PinnedDrop)]
+#[pin_project]
 struct StreamingInner<T, D>
 where
     T: Send + 'static,
     D: Decoder<Item = T, Error = Status> + Send + 'static,
 {
-    #[pin]
-    decode: Option<D::DecodeFuture<'static>>,
     #[pin]
     body: SyncWrapper<Body>,
     decoder: D,
@@ -85,8 +85,6 @@ where
     encoding: Option<CompressionEncoding>,
     max_message_size: Option<usize>,
     _marker: PhantomData<fn() -> T>,
-    #[pin]
-    _pin: PhantomPinned,
 }
 
 impl<T> Streaming<T, ()> {
@@ -230,7 +228,6 @@ where
     let buffer_settings = decoder.buffer_settings();
 
     StreamingInner {
-        decode: None,
         body: SyncWrapper::new(body),
         decoder,
         buffer_settings,
@@ -242,32 +239,6 @@ where
         encoding,
         max_message_size,
         _marker: PhantomData,
-        _pin: PhantomPinned,
-    }
-}
-
-unsafe fn extend_decode_future_lifetime<'a, T, D>(
-    future: D::DecodeFuture<'a>,
-) -> D::DecodeFuture<'static>
-where
-    T: Send + 'static,
-    D: Decoder<Item = T, Error = Status> + Send + 'static,
-{
-    // SAFETY: `StreamingInner` stores the future together with the decoder and
-    // buffers it borrows. The type is !Unpin, the future is always dropped in
-    // `PinnedDrop` before those fields, and no method moves or mutates the
-    // borrowed fields while `decode` is `Some`.
-    unsafe { std::mem::transmute::<D::DecodeFuture<'a>, D::DecodeFuture<'static>>(future) }
-}
-
-#[pinned_drop]
-impl<T, D> PinnedDrop for StreamingInner<T, D>
-where
-    T: Send + 'static,
-    D: Decoder<Item = T, Error = Status> + Send + 'static,
-{
-    fn drop(self: Pin<&mut Self>) {
-        self.project().decode.set(None);
     }
 }
 
@@ -276,35 +247,12 @@ where
     T: Send + 'static,
     D: Decoder<Item = T, Error = Status> + Send + 'static,
 {
-    fn poll_decode_future(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<Option<T>, Status>> {
-        let mut this = self.project();
-        let Some(future) = this.decode.as_mut().as_pin_mut() else {
-            return Poll::Ready(Ok(None));
-        };
-
-        let result = ready!(future.poll(cx));
-        this.decode.set(None);
-
-        if let Ok(Some(_)) = &result {
-            *this.state = State::ReadHeader;
-        }
-
-        Poll::Ready(result)
-    }
-
     fn poll_decode_chunk(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Option<T>, Status>> {
-        if self.as_ref().project_ref().decode.get_ref().is_some() {
-            return self.poll_decode_future(cx);
-        }
-
-        {
-            let mut this = self.as_mut().project();
+        let result = {
+            let this = self.as_mut().project();
 
             if let State::ReadHeader = *this.state {
                 if this.buf.remaining() < HEADER_SIZE {
@@ -359,61 +307,74 @@ where
                 };
             }
 
-            let (len, compression) = match *this.state {
-                State::ReadBody { len, compression } => (len, compression),
-                State::ReadHeader => return Poll::Ready(Ok(None)),
-            };
+            if let State::ReadBody { len, compression } = *this.state {
+                // if we haven't read enough of the message then return and keep
+                // reading
+                if this.buf.remaining() < len || this.buf.len() < len {
+                    return Poll::Ready(Ok(None));
+                }
 
-            // if we haven't read enough of the message then return and keep
-            // reading
-            if this.buf.remaining() < len || this.buf.len() < len {
-                return Poll::Ready(Ok(None));
+                if let Some(encoding) = compression {
+                    this.decompress_buf.clear();
+                    let limit = this
+                        .max_message_size
+                        .unwrap_or(DEFAULT_MAX_RECV_MESSAGE_SIZE);
+                    let limited_out_buf = (&mut *this.decompress_buf).limit(limit);
+
+                    if let Err(err) = decompress(
+                        CompressionSettings {
+                            encoding,
+                            buffer_growth_interval: this.buffer_settings.buffer_size,
+                        },
+                        this.buf,
+                        limited_out_buf,
+                        len,
+                    ) {
+                        if matches!(err.kind(), std::io::ErrorKind::WriteZero) {
+                            return Poll::Ready(Err(Status::resource_exhausted(format!(
+                                "Error decompressing: size limit, of {limit} bytes, exceeded while decompressing message"
+                            ))));
+                        }
+                        let message = if let Direction::Response(status) = *this.direction {
+                            format!(
+                                "Error decompressing: {err}, while receiving response with status: {status}"
+                            )
+                        } else {
+                            format!("Error decompressing: {err}, while sending request")
+                        };
+                        return Poll::Ready(Err(Status::internal(message)));
+                    }
+
+                    *this.state = State::Decode {
+                        decompressed: true,
+                        len: this.decompress_buf.len(),
+                    };
+                } else {
+                    *this.state = State::Decode {
+                        decompressed: false,
+                        len,
+                    };
+                }
             }
 
-            let future = if let Some(encoding) = compression {
-                this.decompress_buf.clear();
-                let limit = this
-                    .max_message_size
-                    .unwrap_or(DEFAULT_MAX_RECV_MESSAGE_SIZE);
-                let limited_out_buf = (&mut *this.decompress_buf).limit(limit);
-
-                if let Err(err) = decompress(
-                    CompressionSettings {
-                        encoding,
-                        buffer_growth_interval: this.buffer_settings.buffer_size,
-                    },
-                    this.buf,
-                    limited_out_buf,
-                    len,
-                ) {
-                    if matches!(err.kind(), std::io::ErrorKind::WriteZero) {
-                        return Poll::Ready(Err(Status::resource_exhausted(format!(
-                            "Error decompressing: size limit, of {limit} bytes, exceeded while decompressing message"
-                        ))));
-                    }
-                    let message = if let Direction::Response(status) = *this.direction {
-                        format!(
-                            "Error decompressing: {err}, while receiving response with status: {status}"
-                        )
-                    } else {
-                        format!("Error decompressing: {err}, while sending request")
-                    };
-                    return Poll::Ready(Err(Status::internal(message)));
-                }
-                let decompressed_len = this.decompress_buf.len();
-                let decode_buf = DecodeBuf::new(this.decompress_buf, decompressed_len);
-                this.decoder.decode(decode_buf)
-            } else {
-                let decode_buf = DecodeBuf::new(this.buf, len);
-                this.decoder.decode(decode_buf)
+            let (decompressed, len) = match *this.state {
+                State::Decode { decompressed, len } => (decompressed, len),
+                State::ReadHeader | State::ReadBody { .. } => return Poll::Ready(Ok(None)),
             };
 
-            // SAFETY: see `extend_decode_future_lifetime`.
-            let future = unsafe { extend_decode_future_lifetime::<T, D>(future) };
-            this.decode.set(Some(future));
-        }
+            if decompressed {
+                let decode_buf = DecodeBuf::new(this.decompress_buf, len);
+                ready!(this.decoder.poll_decode(cx, decode_buf))
+            } else {
+                let decode_buf = DecodeBuf::new(this.buf, len);
+                ready!(this.decoder.poll_decode(cx, decode_buf))
+            }
+        };
 
-        self.poll_decode_future(cx)
+        if let Ok(Some(_)) = &result {
+            *self.as_mut().project().state = State::ReadHeader;
+        }
+        Poll::Ready(result)
     }
 
     fn poll_frame(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<Option<()>, Status>> {

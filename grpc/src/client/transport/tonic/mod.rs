@@ -56,6 +56,7 @@ use tonic::body::Body;
 use tonic::client::Grpc;
 use tonic::client::GrpcService;
 use tonic::codec::Codec;
+use tonic::codec::DecodeBuf;
 use tonic::codec::Decoder;
 use tonic::codec::EncodeBuf;
 use tonic::codec::Encoder;
@@ -564,9 +565,26 @@ impl Encoder for BytesEncoder {
     type Item = Bytes;
     type Error = TonicStatus;
 
-    fn encode(&mut self, item: Self::Item, dst: &mut EncodeBuf<'_>) -> Result<(), Self::Error> {
+    const ENCODE_READY: bool = true;
+
+    fn encode_ready(
+        &mut self,
+        item: Self::Item,
+        mut dst: EncodeBuf<'_>,
+    ) -> Result<(), Self::Error> {
         dst.put_slice(&item);
         Ok(())
+    }
+
+    fn poll_encode(
+        &mut self,
+        _cx: &mut Context<'_>,
+        item: &mut Option<Self::Item>,
+        mut dst: EncodeBuf<'_>,
+    ) -> Poll<Result<(), Self::Error>> {
+        let item = item.take().expect("encoder item available");
+        dst.put_slice(&item);
+        Poll::Ready(Ok(()))
     }
 }
 
@@ -576,9 +594,26 @@ impl Encoder for BufEncoder {
     type Item = Box<dyn Buf + Send + Sync>;
     type Error = TonicStatus;
 
-    fn encode(&mut self, mut item: Self::Item, dst: &mut EncodeBuf<'_>) -> Result<(), Self::Error> {
+    const ENCODE_READY: bool = true;
+
+    fn encode_ready(
+        &mut self,
+        mut item: Self::Item,
+        mut dst: EncodeBuf<'_>,
+    ) -> Result<(), Self::Error> {
         dst.put(&mut *item);
         Ok(())
+    }
+
+    fn poll_encode(
+        &mut self,
+        _cx: &mut Context<'_>,
+        item: &mut Option<Self::Item>,
+        mut dst: EncodeBuf<'_>,
+    ) -> Poll<Result<(), Self::Error>> {
+        let mut item = item.take().expect("encoder item available");
+        dst.put(&mut *item);
+        Poll::Ready(Ok(()))
     }
 }
 
@@ -589,10 +624,11 @@ impl Decoder for BytesDecoder {
     type Item = Bytes;
     type Error = TonicStatus;
 
-    fn decode(
+    fn poll_decode(
         &mut self,
-        src: &mut tonic::codec::DecodeBuf<'_>,
-    ) -> Result<Option<Self::Item>, Self::Error> {
-        Ok(Some(src.copy_to_bytes(src.remaining())))
+        _cx: &mut Context<'_>,
+        mut src: DecodeBuf<'_>,
+    ) -> Poll<Result<Option<Self::Item>, Self::Error>> {
+        Poll::Ready(Ok(Some(src.copy_to_bytes(src.remaining()))))
     }
 }

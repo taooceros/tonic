@@ -1,7 +1,10 @@
 use prost::Message;
-use std::marker::PhantomData;
+use std::{
+    marker::PhantomData,
+    task::{Context, Poll},
+};
 use tonic::Status;
-use tonic::codec::{BufferSettings, Codec, DecodeBuf, Decoder, EncodeBuf, EncodeResult, Encoder};
+use tonic::codec::{BufferSettings, Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
 
 /// A [`Codec`] that implements `application/grpc+proto` via the prost library.
 #[derive(Debug, Clone)]
@@ -94,33 +97,32 @@ impl<T: Message> Encoder for ProstEncoder<T> {
     type Item = T;
     type Error = Status;
 
-    type EncodeFuture<'a>
-        = std::future::Ready<Result<(), Self::Error>>
-    where
-        Self: 'a;
+    const ENCODE_READY: bool = true;
 
     #[inline]
-    fn encode<'a>(
-        &'a mut self,
+    fn encode_ready(
+        &mut self,
         item: Self::Item,
-        mut buf: EncodeBuf<'a>,
-    ) -> Self::EncodeFuture<'a> {
+        mut buf: EncodeBuf<'_>,
+    ) -> Result<(), Self::Error> {
         item.encode(&mut buf)
             .expect("Message only errors if not enough space");
 
-        std::future::ready(Ok(()))
+        Ok(())
     }
 
     #[inline]
-    fn encode_result<'a>(
-        &'a mut self,
-        item: Self::Item,
-        mut buf: EncodeBuf<'a>,
-    ) -> EncodeResult<Self::EncodeFuture<'a>, Self::Error> {
+    fn poll_encode(
+        &mut self,
+        _cx: &mut Context<'_>,
+        item: &mut Option<Self::Item>,
+        mut buf: EncodeBuf<'_>,
+    ) -> Poll<Result<(), Self::Error>> {
+        let item = item.take().expect("encoder item available");
         item.encode(&mut buf)
             .expect("Message only errors if not enough space");
 
-        EncodeResult::Ready(Ok(()))
+        Poll::Ready(Ok(()))
     }
 
     #[inline]
@@ -150,17 +152,16 @@ impl<U: Message + Default> Decoder for ProstDecoder<U> {
     type Item = U;
     type Error = Status;
 
-    type DecodeFuture<'a>
-        = std::future::Ready<Result<Option<Self::Item>, Self::Error>>
-    where
-        Self: 'a;
-
-    fn decode<'a>(&'a mut self, buf: DecodeBuf<'a>) -> Self::DecodeFuture<'a> {
+    fn poll_decode(
+        &mut self,
+        _cx: &mut Context<'_>,
+        buf: DecodeBuf<'_>,
+    ) -> Poll<Result<Option<Self::Item>, Self::Error>> {
         let item = Message::decode(buf)
             .map(Option::Some)
             .map_err(from_decode_error);
 
-        std::future::ready(item)
+        Poll::Ready(item)
     }
 
     fn buffer_settings(&self) -> BufferSettings {
@@ -182,7 +183,7 @@ mod tests {
     use http_body_util::BodyExt as _;
     use std::{
         future::Future,
-        pin::{Pin, pin},
+        pin::pin,
         task::{Context, Poll},
     };
     use tonic::codec::SingleMessageCompressionOverride;
@@ -489,18 +490,26 @@ mod tests {
         type Item = Vec<u8>;
         type Error = Status;
 
-        type EncodeFuture<'a>
-            = std::future::Ready<Result<(), Self::Error>>
-        where
-            Self: 'a;
+        const ENCODE_READY: bool = true;
 
-        fn encode<'a>(
-            &'a mut self,
+        fn encode_ready(
+            &mut self,
             item: Self::Item,
-            mut buf: EncodeBuf<'a>,
-        ) -> Self::EncodeFuture<'a> {
+            mut buf: EncodeBuf<'_>,
+        ) -> Result<(), Self::Error> {
             buf.put(&item[..]);
-            std::future::ready(Ok(()))
+            Ok(())
+        }
+
+        fn poll_encode(
+            &mut self,
+            _cx: &mut Context<'_>,
+            item: &mut Option<Self::Item>,
+            mut buf: EncodeBuf<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            let item = item.take().expect("encoder item available");
+            buf.put(&item[..]);
+            Poll::Ready(Ok(()))
         }
 
         fn buffer_settings(&self) -> BufferSettings {
@@ -509,47 +518,29 @@ mod tests {
     }
 
     #[derive(Debug, Clone, Default)]
-    struct PendingEncoder {}
+    struct PendingEncoder {
+        yielded: bool,
+    }
 
     impl Encoder for PendingEncoder {
         type Item = Vec<u8>;
         type Error = Status;
 
-        type EncodeFuture<'a>
-            = PendingEncode<'a>
-        where
-            Self: 'a;
-
-        fn encode<'a>(
-            &'a mut self,
-            item: Self::Item,
-            buf: EncodeBuf<'a>,
-        ) -> Self::EncodeFuture<'a> {
-            PendingEncode {
-                item: Some(item),
-                buf,
-                yielded: false,
-            }
-        }
-    }
-    struct PendingEncode<'a> {
-        item: Option<Vec<u8>>,
-        buf: EncodeBuf<'a>,
-        yielded: bool,
-    }
-
-    impl Future for PendingEncode<'_> {
-        type Output = Result<(), Status>;
-
-        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        fn poll_encode(
+            &mut self,
+            cx: &mut Context<'_>,
+            item: &mut Option<Self::Item>,
+            mut buf: EncodeBuf<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
             if !self.yielded {
                 self.yielded = true;
                 cx.waker().wake_by_ref();
                 return Poll::Pending;
             }
 
-            let item = self.item.take().expect("item available");
-            self.buf.put(&item[..]);
+            self.yielded = false;
+            let item = item.take().expect("encoder item available");
+            buf.put(&item[..]);
             Poll::Ready(Ok(()))
         }
     }
@@ -561,15 +552,14 @@ mod tests {
         type Item = Vec<u8>;
         type Error = Status;
 
-        type DecodeFuture<'a>
-            = std::future::Ready<Result<Option<Self::Item>, Self::Error>>
-        where
-            Self: 'a;
-
-        fn decode<'a>(&'a mut self, mut buf: DecodeBuf<'a>) -> Self::DecodeFuture<'a> {
+        fn poll_decode(
+            &mut self,
+            _cx: &mut Context<'_>,
+            mut buf: DecodeBuf<'_>,
+        ) -> Poll<Result<Option<Self::Item>, Self::Error>> {
             let out = Vec::from(buf.chunk());
             buf.advance(LEN);
-            std::future::ready(Ok(Some(out)))
+            Poll::Ready(Ok(Some(out)))
         }
 
         fn buffer_settings(&self) -> BufferSettings {
@@ -578,45 +568,26 @@ mod tests {
     }
 
     #[derive(Debug, Clone, Default)]
-    struct PendingDecoder {}
+    struct PendingDecoder {
+        yielded: bool,
+    }
 
     impl Decoder for PendingDecoder {
         type Item = Vec<u8>;
         type Error = Status;
 
-        type DecodeFuture<'a>
-            = PendingDecode<'a>
-        where
-            Self: 'a;
-
-        fn decode<'a>(&'a mut self, buf: DecodeBuf<'a>) -> Self::DecodeFuture<'a> {
-            PendingDecode {
-                buf: Some(buf),
-                yielded: false,
-            }
-        }
-
-        fn buffer_settings(&self) -> BufferSettings {
-            Default::default()
-        }
-    }
-
-    struct PendingDecode<'a> {
-        buf: Option<DecodeBuf<'a>>,
-        yielded: bool,
-    }
-
-    impl Future for PendingDecode<'_> {
-        type Output = Result<Option<Vec<u8>>, Status>;
-
-        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        fn poll_decode(
+            &mut self,
+            cx: &mut Context<'_>,
+            mut buf: DecodeBuf<'_>,
+        ) -> Poll<Result<Option<Self::Item>, Self::Error>> {
             if !self.yielded {
                 self.yielded = true;
                 cx.waker().wake_by_ref();
                 return Poll::Pending;
             }
 
-            let mut buf = self.buf.take().expect("buffer available");
+            self.yielded = false;
             let out = Vec::from(buf.chunk());
             buf.advance(LEN);
             Poll::Ready(Ok(Some(out)))

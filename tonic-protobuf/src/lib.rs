@@ -23,10 +23,13 @@
  */
 
 use bytes::{Buf, BufMut};
-use std::marker::PhantomData;
+use std::{
+    marker::PhantomData,
+    task::{Context, Poll},
+};
 use tonic::{
     Status,
-    codec::{Codec, DecodeBuf, Decoder, EncodeBuf, EncodeResult, Encoder},
+    codec::{Codec, DecodeBuf, Decoder, EncodeBuf, Encoder},
 };
 
 pub use protobuf;
@@ -82,32 +85,29 @@ impl<T: Message> Encoder for ProtoEncoder<T> {
     type Item = T;
     type Error = Status;
 
-    type EncodeFuture<'a>
-        = std::future::Ready<Result<(), Self::Error>>
-    where
-        Self: 'a;
+    const ENCODE_READY: bool = true;
 
-    fn encode<'a>(
-        &'a mut self,
+    fn encode_ready(
+        &mut self,
         item: Self::Item,
-        mut buf: EncodeBuf<'a>,
-    ) -> Self::EncodeFuture<'a> {
+        mut buf: EncodeBuf<'_>,
+    ) -> Result<(), Self::Error> {
         // The protobuf library doesn't support serializing into a user-provided
         // buffer. Instead, it allocates its own buffer, resulting in an extra
         // copy and allocation.
         // TODO: #2345 - Find a way to avoid this extra copy.
-        let result = item
-            .serialize()
+        item.serialize()
             .map_err(from_decode_error)
-            .map(|serialized| buf.put_slice(serialized.as_slice()));
-        std::future::ready(result)
+            .map(|serialized| buf.put_slice(serialized.as_slice()))
     }
 
-    fn encode_result<'a>(
-        &'a mut self,
-        item: Self::Item,
-        mut buf: EncodeBuf<'a>,
-    ) -> EncodeResult<Self::EncodeFuture<'a>, Self::Error> {
+    fn poll_encode(
+        &mut self,
+        _cx: &mut Context<'_>,
+        item: &mut Option<Self::Item>,
+        mut buf: EncodeBuf<'_>,
+    ) -> Poll<Result<(), Self::Error>> {
+        let item = item.take().expect("encoder item available");
         // The protobuf library doesn't support serializing into a user-provided
         // buffer. Instead, it allocates its own buffer, resulting in an extra
         // copy and allocation.
@@ -116,7 +116,7 @@ impl<T: Message> Encoder for ProtoEncoder<T> {
             .serialize()
             .map_err(from_decode_error)
             .map(|serialized| buf.put_slice(serialized.as_slice()));
-        EncodeResult::Ready(result)
+        Poll::Ready(result)
     }
 }
 
@@ -137,16 +137,15 @@ impl<U: Message + Default> Decoder for ProtoDecoder<U> {
     type Item = U;
     type Error = Status;
 
-    type DecodeFuture<'a>
-        = std::future::Ready<Result<Option<Self::Item>, Self::Error>>
-    where
-        Self: 'a;
-
-    fn decode<'a>(&'a mut self, mut buf: DecodeBuf<'a>) -> Self::DecodeFuture<'a> {
+    fn poll_decode(
+        &mut self,
+        _cx: &mut Context<'_>,
+        mut buf: DecodeBuf<'_>,
+    ) -> Poll<Result<Option<Self::Item>, Self::Error>> {
         let slice = buf.chunk();
         let item = U::parse(slice).map_err(from_decode_error);
         buf.advance(slice.len());
-        std::future::ready(item.map(Some))
+        Poll::Ready(item.map(Some))
     }
 }
 

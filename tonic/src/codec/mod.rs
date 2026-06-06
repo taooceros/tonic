@@ -7,7 +7,10 @@ pub(crate) mod compression;
 mod decode;
 mod encode;
 use crate::Status;
-use std::{future::Future, io};
+use std::{
+    io,
+    task::{Context, Poll},
+};
 
 pub use self::buffer::{DecodeBuf, EncodeBuf};
 pub use self::compression::{CompressionEncoding, EnabledCompressionEncodings};
@@ -119,16 +122,6 @@ pub trait Codec {
     fn decoder(&mut self) -> Self::Decoder;
 }
 
-/// Result of starting an encode operation.
-#[derive(Debug)]
-#[doc(hidden)]
-pub enum EncodeResult<F, E> {
-    /// Encoding completed immediately.
-    Ready(Result<(), E>),
-    /// Encoding must be polled to completion.
-    Future(F),
-}
-
 /// Encodes gRPC message types
 pub trait Encoder {
     /// The type that is encoded.
@@ -139,24 +132,31 @@ pub trait Encoder {
     /// The type of unrecoverable frame encoding errors.
     type Error: From<io::Error>;
 
-    /// The future returned by [`Encoder::encode`].
-    type EncodeFuture<'a>: Future<Output = Result<(), Self::Error>> + Send + 'a
-    where
-        Self: 'a;
+    #[doc(hidden)]
+    const ENCODE_READY: bool = false;
 
-    /// Encodes a message into the provided buffer.
-    fn encode<'a>(&'a mut self, item: Self::Item, dst: EncodeBuf<'a>) -> Self::EncodeFuture<'a>;
-
-    /// Encodes a message immediately when possible, otherwise returns a future.
+    /// Encodes one message immediately.
+    ///
+    /// Implementations that set [`Self::ENCODE_READY`] to `true` must override
+    /// this method and complete without yielding.
     #[inline]
     #[doc(hidden)]
-    fn encode_result<'a>(
-        &'a mut self,
-        item: Self::Item,
-        dst: EncodeBuf<'a>,
-    ) -> EncodeResult<Self::EncodeFuture<'a>, Self::Error> {
-        EncodeResult::Future(self.encode(item, dst))
+    fn encode_ready(&mut self, item: Self::Item, _dst: EncodeBuf<'_>) -> Result<(), Self::Error> {
+        let _ = item;
+        unreachable!("ENCODE_READY encoders must override encode_ready")
     }
+
+    /// Polls encoding of one message into the provided buffer.
+    ///
+    /// `item` contains the message until encoding completes. Implementations
+    /// must leave it in place when returning [`Poll::Pending`] and take it
+    /// before returning [`Poll::Ready`].
+    fn poll_encode(
+        &mut self,
+        cx: &mut Context<'_>,
+        item: &mut Option<Self::Item>,
+        dst: EncodeBuf<'_>,
+    ) -> Poll<Result<(), Self::Error>>;
 
     /// Controls how tonic creates and expands encode buffers.
     fn buffer_settings(&self) -> BufferSettings {
@@ -172,17 +172,16 @@ pub trait Decoder {
     /// The type of unrecoverable frame decoding errors.
     type Error: From<io::Error>;
 
-    /// The future returned by [`Decoder::decode`].
-    type DecodeFuture<'a>: Future<Output = Result<Option<Self::Item>, Self::Error>> + Send + 'a
-    where
-        Self: 'a;
-
-    /// Decode a message from the buffer.
+    /// Polls decoding of one full message from the provided buffer.
     ///
-    /// The buffer will contain exactly the bytes of a full message. There
-    /// is no need to get the length from the bytes, gRPC framing is handled
-    /// for you.
-    fn decode<'a>(&'a mut self, src: DecodeBuf<'a>) -> Self::DecodeFuture<'a>;
+    /// The buffer contains exactly the bytes of a full message. Implementations
+    /// must not retain or advance the buffer after returning [`Poll::Pending`];
+    /// tonic will pass a fresh view of the same message bytes on the next poll.
+    fn poll_decode(
+        &mut self,
+        cx: &mut Context<'_>,
+        src: DecodeBuf<'_>,
+    ) -> Poll<Result<Option<Self::Item>, Self::Error>>;
 
     /// Controls how tonic creates and expands decode buffers.
     fn buffer_settings(&self) -> BufferSettings {
