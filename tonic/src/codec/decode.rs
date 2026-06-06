@@ -78,6 +78,7 @@ where
     decoder: D,
     buffer_settings: BufferSettings,
     state: State,
+    is_end_stream: bool,
     direction: Direction,
     buf: BytesMut,
     trailers: Option<HeaderMap>,
@@ -232,6 +233,7 @@ where
         decoder,
         buffer_settings,
         state: State::ReadHeader,
+        is_end_stream: false,
         direction,
         buf: BytesMut::with_capacity(buffer_settings.buffer_size),
         trailers: None,
@@ -443,16 +445,24 @@ where
     type Item = Result<StreamingEvent<T>, Status>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if *self.as_ref().project_ref().is_end_stream {
+            return Poll::Ready(None);
+        }
         loop {
             match ready!(self.as_mut().poll_decode_chunk(cx)) {
                 Ok(Some(item)) => return Poll::Ready(Some(Ok(StreamingEvent::Message(item)))),
                 Ok(None) => {}
-                Err(status) => return Poll::Ready(Some(Err(status))),
+                Err(status) => {
+                    *self.as_mut().project().is_end_stream = true;
+                    return Poll::Ready(Some(Err(status)));
+                }
             }
 
             match ready!(self.as_mut().poll_frame(cx)) {
                 Ok(Some(())) => {}
                 Ok(None) => {
+                    *self.as_mut().project().is_end_stream = true;
+
                     if let Err(status) = self.as_mut().response() {
                         return Poll::Ready(Some(Err(status)));
                     }
@@ -463,7 +473,10 @@ where
 
                     return Poll::Ready(None);
                 }
-                Err(status) => return Poll::Ready(Some(Err(status))),
+                Err(status) => {
+                    *self.as_mut().project().is_end_stream = true;
+                    return Poll::Ready(Some(Err(status)));
+                }
             }
         }
     }
