@@ -186,7 +186,7 @@ where
     #[inline]
     fn take_buf_if_over_threshold(mut self: Pin<&mut Self>) -> Option<Bytes> {
         let this = self.as_mut().project();
-        if this.buf.len() >= this.buffer_settings.yield_threshold {
+        if !this.buf.is_empty() && this.buf.len() >= this.buffer_settings.yield_threshold {
             Some(take_buf(this.buf))
         } else {
             None
