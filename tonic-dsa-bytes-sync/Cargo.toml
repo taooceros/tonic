@@ -14,7 +14,11 @@ rust-version = { workspace = true }
 [dependencies]
 bytes = "1"
 idxd-rust = { path = "../../../idxd-rust" }
-tonic = { version = "0.14.6", path = "../tonic", default-features = false }
+tonic = { version = "0.14.6", path = "../tonic", default-features = false, features = ["transport", "router"] }
+http = "1"
+http-body = "1"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread"] }
+tower-service = "0.3"
 
 
 [[bench]]
@@ -23,7 +27,6 @@ harness = false
 
 [dev-dependencies]
 bencher = "0.1.5"
-http-body = "1"
 tokio-stream = "0.1"
 
 [lints]
