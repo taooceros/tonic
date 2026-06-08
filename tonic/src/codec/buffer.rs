@@ -68,6 +68,41 @@ impl EncodeBuf<'_> {
     pub fn reserve(&mut self, additional: usize) {
         self.buf.reserve(additional);
     }
+    /// Reserves `len` bytes of spare capacity and lets the caller initialize it.
+    ///
+    /// The readable length is advanced only if `write` returns `Ok(())`.
+    ///
+    /// # Safety
+    ///
+    /// `write` must initialize exactly `len` bytes at the provided pointer before
+    /// returning `Ok(())`. It must not read from the pointer, retain the pointer,
+    /// or return before any external writer using the pointer has completed.
+    #[doc(hidden)]
+    #[inline]
+    pub unsafe fn put_uninit_slice_with<E>(
+        &mut self,
+        len: usize,
+        write: impl FnOnce(*mut u8) -> Result<(), E>,
+    ) -> Result<(), E> {
+        if len == 0 {
+            return write(std::ptr::NonNull::<u8>::dangling().as_ptr());
+        }
+
+        self.buf.reserve(len);
+        let chunk = self.buf.chunk_mut();
+        assert!(chunk.len() >= len);
+        let dst = chunk.as_mut_ptr();
+
+        write(dst)?;
+
+        // SAFETY: The caller guarantees that `write` initialized exactly `len`
+        // bytes at `dst` before returning `Ok(())`.
+        unsafe {
+            self.buf.advance_mut(len);
+        }
+
+        Ok(())
+    }
 }
 
 unsafe impl BufMut for EncodeBuf<'_> {
@@ -142,5 +177,35 @@ mod tests {
 
         buf.put_u8(b'a');
         assert_eq!(buf.remaining_mut(), initial - 20 - 1);
+    }
+
+    #[test]
+    fn encode_buf_put_uninit_slice_with_advances_only_on_success() {
+        let mut bytes = BytesMut::with_capacity(16);
+        let mut buf = EncodeBuf::new(&mut bytes);
+
+        // SAFETY: The closure initializes exactly the requested 3 bytes and
+        // returns success, so advancing the readable length is valid.
+        unsafe {
+            buf.put_uninit_slice_with(3, |dst| {
+                std::ptr::copy_nonoverlapping(b"abc".as_ptr(), dst, 3);
+                Ok::<_, ()>(())
+            })
+            .expect("write succeeds");
+        }
+        assert_eq!(&buf.buf[..], b"abc");
+
+        // SAFETY: The closure writes within the requested 3-byte range but
+        // returns an error, so the readable length must not advance.
+        unsafe {
+            let err = buf
+                .put_uninit_slice_with(3, |dst| {
+                    std::ptr::copy_nonoverlapping(b"def".as_ptr(), dst, 3);
+                    Err::<(), _>("fail")
+                })
+                .expect_err("write fails");
+            assert_eq!(err, "fail");
+        }
+        assert_eq!(&buf.buf[..], b"abc");
     }
 }
