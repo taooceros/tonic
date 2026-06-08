@@ -1,0 +1,28 @@
+[package]
+name = "tonic-bytes-bench"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Neutral bytes codec benchmark harness for tonic DSA experiments"
+publish = false
+rust-version = { workspace = true }
+
+[dependencies]
+bytes = "1"
+http = "1"
+http-body = "1"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync"] }
+tokio-stream = "0.1"
+tonic = { version = "0.14.6", path = "../tonic", default-features = false, features = ["transport", "router"] }
+tonic-dsa-bytes-async = { path = "../tonic-dsa-bytes-async" }
+tonic-dsa-bytes-sync = { path = "../tonic-dsa-bytes-sync" }
+tower-service = "0.3"
+
+[lints]
+workspace = true
+
+[package.metadata.cargo_check_external_types]
+allowed_external_types = [
+  "tonic::*",
+  "bytes::*",
+]

@@ -37,6 +37,7 @@ struct InFlightEncode<I> {
     item: Option<I>,
     offset: usize,
     compression_encoding: Option<CompressionEncoding>,
+    requires_stable_encode_buf: bool,
 }
 
 impl<T, U> EncodedBytes<T, U>
@@ -112,6 +113,7 @@ where
                     item: Some(item),
                     offset,
                     compression_encoding,
+                    requires_stable_encode_buf: false,
                 });
                 return Ok(false);
             }
@@ -140,9 +142,15 @@ where
             };
 
             let dst = if in_flight.compression_encoding.is_some() {
-                EncodeBuf::new(this.uncompression_buf)
+                EncodeBuf::new_with_stable_storage_flag(
+                    this.uncompression_buf,
+                    &mut in_flight.requires_stable_encode_buf,
+                )
             } else {
-                EncodeBuf::new(this.buf)
+                EncodeBuf::new_with_stable_storage_flag(
+                    this.buf,
+                    &mut in_flight.requires_stable_encode_buf,
+                )
             };
 
             ready!(this.encoder.poll_encode(cx, &mut in_flight.item, dst))
@@ -153,6 +161,7 @@ where
             item,
             offset,
             compression_encoding,
+            requires_stable_encode_buf: _,
         } = this
             .in_flight
             .take()
@@ -174,6 +183,9 @@ where
     fn take_buf_before_in_flight(mut self: Pin<&mut Self>) -> Option<Bytes> {
         let this = self.as_mut().project();
         let in_flight = this.in_flight.as_mut()?;
+        if in_flight.requires_stable_encode_buf {
+            return None;
+        }
         if in_flight.offset == 0 {
             return None;
         }

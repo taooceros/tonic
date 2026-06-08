@@ -8,6 +8,8 @@ members = [
   "tonic-reflection",
   "tonic-prost",
   "tonic-dsa-bytes-sync",
+  "tonic-dsa-bytes-async",
+  "tonic-bytes-bench",
   "tonic-prost-build",
   "tonic-web",
   "examples",
