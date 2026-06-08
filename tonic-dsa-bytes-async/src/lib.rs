@@ -26,7 +26,7 @@ use idxd_rust::{DsaCompletionRecord, DsaCompletionStatus, DsaHwDesc, WqPortal, d
 use std::{
     fmt,
     marker::PhantomPinned,
-    path::{Path, PathBuf},
+    path::PathBuf,
     pin::Pin,
     sync::{Arc, LazyLock, Mutex},
     task::{Context, Poll},
@@ -36,6 +36,8 @@ use tonic::codec::{BufferSettings, Codec, DecodeBuf, Decoder, EncodeBuffer, Enco
 
 const DEFAULT_DSA_MIN_MESSAGE_BYTES: usize = 1;
 const PAGE_SIZE: usize = 4096;
+const DSA_COMP_STATUS_WRITE: u8 = 0x80;
+const MAX_NO_PROGRESS_PAGE_FAULT_RETRIES: usize = 4;
 
 static PROCESS_DSA_WORK_QUEUE: LazyLock<Mutex<Option<SharedDsaWorkQueue>>> =
     LazyLock::new(|| Mutex::new(None));
@@ -510,6 +512,144 @@ impl PendingCopy {
     }
 }
 
+#[derive(Debug)]
+struct DsaMemmoveRetry {
+    src: *const u8,
+    dst: *mut u8,
+    remaining: usize,
+    original_len: usize,
+    retry_count: usize,
+    max_retries: usize,
+    no_progress_retry_count: usize,
+}
+
+impl DsaMemmoveRetry {
+    fn new(src: *const u8, dst: *mut u8, len: usize) -> Self {
+        Self {
+            src,
+            dst,
+            remaining: len,
+            original_len: len,
+            retry_count: 0,
+            max_retries: len.div_ceil(PAGE_SIZE).saturating_mul(2).saturating_add(4),
+            no_progress_retry_count: 0,
+        }
+    }
+
+    fn fill_desc(&self, desc: &mut DsaHwDesc) -> Result<(), Status> {
+        if self.remaining > u32::MAX as usize {
+            return Err(Status::internal(format!(
+                "async dsa bytes encode cannot copy remaining {} bytes; maximum DSA transfer is {} bytes",
+                self.remaining,
+                u32::MAX
+            )));
+        }
+
+        desc.fill_memmove(self.src, self.dst, self.remaining as u32);
+        Ok(())
+    }
+
+    fn handle_completion(
+        &mut self,
+        completion: DsaCompletionRecord,
+        device_path: &PathBuf,
+    ) -> Result<DsaRetryAction, Status> {
+        let raw_status = completion.status();
+        let status = DsaCompletionStatus::mask(raw_status);
+        if status == DsaCompletionStatus::Success.as_u8() {
+            return Ok(DsaRetryAction::Complete);
+        }
+
+        if status != DsaCompletionStatus::PageFaultNoBof.as_u8() {
+            return Err(dsa_completion_error(
+                "async dsa bytes encode failed",
+                completion,
+                self.original_len,
+                self.remaining,
+                device_path,
+            ));
+        }
+
+        self.handle_page_fault(
+            raw_status,
+            completion.bytes_completed(),
+            completion.fault_addr(),
+            device_path,
+        )?;
+        Ok(DsaRetryAction::Retry)
+    }
+
+    fn handle_page_fault(
+        &mut self,
+        raw_status: u8,
+        bytes_completed: u32,
+        fault_addr: u64,
+        device_path: &PathBuf,
+    ) -> Result<(), Status> {
+        if self.retry_count >= self.max_retries {
+            return Err(Status::internal(format!(
+                "async dsa bytes encode page-fault retry limit exceeded on {} for {} bytes: retries={} remaining={} fault_addr={fault_addr:#x}",
+                device_path.display(),
+                self.original_len,
+                self.retry_count,
+                self.remaining
+            )));
+        }
+
+        let completed = bytes_completed as usize;
+        if completed > self.remaining {
+            return Err(Status::internal(format!(
+                "async dsa bytes encode page fault on {} reported bytes_completed={} beyond remaining {} for {} byte transfer",
+                device_path.display(),
+                completed,
+                self.remaining,
+                self.original_len
+            )));
+        }
+
+        if completed == 0 {
+            self.no_progress_retry_count += 1;
+            if self.no_progress_retry_count > MAX_NO_PROGRESS_PAGE_FAULT_RETRIES {
+                return Err(Status::internal(format!(
+                    "async dsa bytes encode made no progress after {} page-fault retries on {} for {} bytes: remaining={} fault_addr={fault_addr:#x}",
+                    self.no_progress_retry_count,
+                    device_path.display(),
+                    self.original_len,
+                    self.remaining
+                )));
+            }
+        } else {
+            self.no_progress_retry_count = 0;
+        }
+
+        touch_fault_addr(raw_status, fault_addr)?;
+
+        if completed == self.remaining {
+            return Err(Status::internal(format!(
+                "async dsa bytes encode page fault on {} left no remaining bytes to retry for {} byte transfer",
+                device_path.display(),
+                self.original_len
+            )));
+        }
+
+        // SAFETY: `completed <= self.remaining`, and both pointers describe the
+        // current still-owned source/destination ranges for this memmove.
+        unsafe {
+            self.src = self.src.add(completed);
+            self.dst = self.dst.add(completed);
+        }
+        self.remaining -= completed;
+        self.retry_count += 1;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DsaRetryAction {
+    Complete,
+    Retry,
+}
+
 struct PendingDsaCopy {
     work_queue: SharedDsaWorkQueue,
     source: Bytes,
@@ -518,6 +658,7 @@ struct PendingDsaCopy {
     dst_len: usize,
     desc: DsaHwDesc,
     completion: DsaCompletionRecord,
+    retry: Option<DsaMemmoveRetry>,
     submitted: bool,
     completed: bool,
     _pin: PhantomPinned,
@@ -538,6 +679,7 @@ impl PendingDsaCopy {
             dst_len: 0,
             desc: DsaHwDesc::default(),
             completion: DsaCompletionRecord::default(),
+            retry: None,
             submitted: false,
             completed: false,
             _pin: PhantomPinned,
@@ -557,11 +699,9 @@ impl PendingDsaCopy {
             let dst_ptr = unsafe { dst.reserve_uninit_slice_for_pending(len) };
             touch_pages_for_dsa(this.source.as_ptr(), dst_ptr, len);
 
-            this.completion.clear();
-            this.desc
-                .fill_memmove(this.source.as_ptr(), dst_ptr, len as u32);
-            this.desc.set_completion(this.completion);
-            this.work_queue.submit(this.desc);
+            let retry = DsaMemmoveRetry::new(this.source.as_ptr(), dst_ptr, len);
+            submit_retry(this.work_queue, this.desc, this.completion, &retry)?;
+            *this.retry = Some(retry);
             *this.dst = dst_ptr;
             *this.dst_len = len;
             *this.submitted = true;
@@ -572,13 +712,10 @@ impl PendingDsaCopy {
             return Poll::Pending;
         }
 
-        *this.completed = true;
-        match ensure_dsa_success(
-            *this.completion,
-            this.source.len(),
-            &this.work_queue.config.device_path,
-        ) {
-            Ok(()) => {
+        let retry = this.retry.as_mut().expect("pending retry state available");
+        match retry.handle_completion(*this.completion, &this.work_queue.config.device_path) {
+            Ok(DsaRetryAction::Complete) => {
+                *this.completed = true;
                 let mut buf = this.buf.take().expect("pending encode buffer available");
                 // SAFETY: DSA completion with success means the descriptor has
                 // initialized the exact bytes in the reservation made on the
@@ -590,7 +727,15 @@ impl PendingDsaCopy {
                 }
                 Poll::Ready(Ok(buf))
             }
-            Err(status) => Poll::Ready(Err(status)),
+            Ok(DsaRetryAction::Retry) => {
+                submit_retry(this.work_queue, this.desc, this.completion, retry)?;
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+            Err(status) => {
+                *this.completed = true;
+                Poll::Ready(Err(status))
+            }
         }
     }
 
@@ -617,6 +762,7 @@ impl PendingDsaCopy {
             dst: &mut this.dst,
             dst_len: &mut this.dst_len,
             desc: &mut this.desc,
+            retry: &mut this.retry,
             completion: &mut this.completion,
             submitted: &mut this.submitted,
             completed: &mut this.completed,
@@ -638,6 +784,7 @@ struct PendingDsaCopyProjection<'a> {
     dst_len: &'a mut usize,
     desc: &'a mut DsaHwDesc,
     completion: &'a mut DsaCompletionRecord,
+    retry: &'a mut Option<DsaMemmoveRetry>,
     submitted: &'a mut bool,
     completed: &'a mut bool,
 }
@@ -673,24 +820,62 @@ impl PendingYieldingCpuCopy {
     }
 }
 
-fn ensure_dsa_success(
+fn submit_retry(
+    work_queue: &DsaWorkQueue,
+    desc: &mut DsaHwDesc,
+    completion: &mut DsaCompletionRecord,
+    retry: &DsaMemmoveRetry,
+) -> Result<(), Status> {
+    completion.clear();
+    retry.fill_desc(desc)?;
+    desc.set_completion(completion);
+    work_queue.submit(desc);
+    Ok(())
+}
+
+fn dsa_completion_error(
+    context: &str,
     completion: DsaCompletionRecord,
     encoded_len: usize,
-    device_path: &Path,
-) -> Result<(), Status> {
+    remaining: usize,
+    device_path: &PathBuf,
+) -> Status {
     let raw_status = completion.status();
-    let status = DsaCompletionStatus::mask(raw_status);
-    if status == DsaCompletionStatus::Success.as_u8() {
-        return Ok(());
-    }
-
-    Err(Status::internal(format!(
-        "async dsa bytes encode failed on {} for {encoded_len} bytes: status={raw_status:#04x} result={:#04x} bytes_completed={} fault_addr={:#x}",
+    Status::internal(format!(
+        "{context} on {} for {encoded_len} bytes: status={raw_status:#04x} result={:#04x} bytes_completed={} fault_addr={:#x} remaining={remaining}",
         device_path.display(),
         completion.result(),
         completion.bytes_completed(),
         completion.fault_addr()
-    )))
+    ))
+}
+
+fn touch_fault_addr(raw_status: u8, fault_addr: u64) -> Result<(), Status> {
+    if fault_addr == 0 {
+        return Err(Status::internal(
+            "async dsa bytes encode page fault reported a null fault address",
+        ));
+    }
+
+    let ptr = fault_addr as *mut u8;
+    if raw_status & DSA_COMP_STATUS_WRITE != 0 {
+        // SAFETY: DSA reports `fault_addr` as a process virtual address that
+        // faulted on a write. The destination may be tonic's uninitialized spare
+        // capacity, so write a byte to fault the page in without first reading
+        // an uninitialized value. DSA will overwrite the byte when the adjusted
+        // descriptor is resubmitted.
+        unsafe {
+            std::ptr::write_volatile(ptr, 0);
+        }
+    } else {
+        // SAFETY: DSA reports `fault_addr` as a process virtual address that
+        // faulted on a read. A volatile read is enough to fault the page in.
+        unsafe {
+            let _ = std::ptr::read_volatile(ptr.cast_const());
+        }
+    }
+
+    Ok(())
 }
 
 fn touch_pages_for_dsa(src: *const u8, dst: *mut u8, len: usize) {
@@ -724,6 +909,62 @@ mod tests {
     use http_body::Body;
     use std::pin::pin;
     use tonic::codec::{EncodeBody, HEADER_SIZE};
+
+    #[test]
+    fn page_fault_retry_advances_memmove_descriptor() {
+        let src = [0x5a; 512];
+        let mut dst = [0u8; 512];
+        let device_path = PathBuf::from("/dev/dsa/test");
+        let mut retry = DsaMemmoveRetry::new(src.as_ptr(), dst.as_mut_ptr(), src.len());
+        let fault_addr = dst.as_mut_ptr() as u64;
+
+        retry
+            .handle_page_fault(
+                DSA_COMP_STATUS_WRITE | DsaCompletionStatus::PageFaultNoBof.as_u8(),
+                128,
+                fault_addr,
+                &device_path,
+            )
+            .expect("page fault adjusted for retry");
+
+        let mut desc = DsaHwDesc::default();
+        retry.fill_desc(&mut desc).expect("descriptor filled");
+
+        assert_eq!(desc.src_addr(), src.as_ptr().wrapping_add(128) as u64);
+        assert_eq!(desc.dst_addr(), dst.as_mut_ptr().wrapping_add(128) as u64);
+        assert_eq!(desc.xfer_size(), 384);
+        assert_eq!(dst[0], 0);
+    }
+
+    #[test]
+    fn page_fault_retry_rejects_repeated_no_progress() {
+        let src = [0x5a; 64];
+        let mut dst = [0u8; 64];
+        let device_path = PathBuf::from("/dev/dsa/test");
+        let mut retry = DsaMemmoveRetry::new(src.as_ptr(), dst.as_mut_ptr(), src.len());
+        let fault_addr = src.as_ptr() as u64;
+
+        for _ in 0..MAX_NO_PROGRESS_PAGE_FAULT_RETRIES {
+            retry
+                .handle_page_fault(
+                    DsaCompletionStatus::PageFaultNoBof.as_u8(),
+                    0,
+                    fault_addr,
+                    &device_path,
+                )
+                .expect("bounded no-progress retry allowed");
+        }
+
+        let err = retry
+            .handle_page_fault(
+                DsaCompletionStatus::PageFaultNoBof.as_u8(),
+                0,
+                fault_addr,
+                &device_path,
+            )
+            .expect_err("repeated no-progress retry rejected");
+        assert!(err.to_string().contains("made no progress"));
+    }
 
     impl DsaAsyncBytesEncoder {
         fn yielding_cpu_for_tests(buffer_settings: BufferSettings) -> Self {

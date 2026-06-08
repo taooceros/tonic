@@ -21,14 +21,13 @@ mod dsa_buf;
 
 pub use dsa_buf::{DsaBufCodec, DsaSyncBufEncoder, DsaSyncBytesDecoder};
 
-use idxd_rust::{DsaCompletionRecord, DsaCompletionStatus, DsaEngine, DsaHwDesc};
+use idxd_rust::{DsaCompletionRecord, DsaEngine, DsaHwDesc};
 use std::{
     fmt,
     path::PathBuf,
     sync::{Arc, OnceLock},
     task::{Context, Poll},
 };
-use tonic::Status;
 
 const DEFAULT_DSA_MIN_MESSAGE_BYTES: usize = 1;
 
@@ -194,26 +193,6 @@ fn poll_dsa_descriptor_to_completion(engine: &DsaEngine, desc: DsaHwDesc) -> Dsa
             Poll::Pending => core::hint::spin_loop(),
         }
     }
-}
-
-fn ensure_dsa_success(
-    completion: DsaCompletionRecord,
-    encoded_len: usize,
-    device_path: &PathBuf,
-) -> Result<(), Status> {
-    let raw_status = completion.status();
-    let status = DsaCompletionStatus::mask(raw_status);
-    if status == DsaCompletionStatus::Success.as_u8() {
-        return Ok(());
-    }
-
-    Err(Status::internal(format!(
-        "dsa bytes encode failed on {} for {encoded_len} bytes: status={raw_status:#04x} result={:#04x} bytes_completed={} fault_addr={:#x}",
-        device_path.display(),
-        completion.result(),
-        completion.bytes_completed(),
-        completion.fault_addr()
-    )))
 }
 
 #[cfg(test)]
