@@ -1,6 +1,7 @@
 use prost::Message;
 use std::{
     marker::PhantomData,
+    pin::Pin,
     task::{Context, Poll},
 };
 use tonic::Status;
@@ -101,28 +102,15 @@ impl<T: Message> Encoder for ProstEncoder<T> {
 
     #[inline]
     fn encode_ready(
-        &mut self,
+        self: Pin<&mut Self>,
         item: Self::Item,
         mut buf: EncodeBuf<'_>,
     ) -> Result<(), Self::Error> {
+        let _ = self;
         item.encode(&mut buf)
             .expect("Message only errors if not enough space");
 
         Ok(())
-    }
-
-    #[inline]
-    fn poll_encode(
-        &mut self,
-        _cx: &mut Context<'_>,
-        item: &mut Option<Self::Item>,
-        mut buf: EncodeBuf<'_>,
-    ) -> Poll<Result<(), Self::Error>> {
-        let item = item.take().expect("encoder item available");
-        item.encode(&mut buf)
-            .expect("Message only errors if not enough space");
-
-        Poll::Ready(Ok(()))
     }
 
     #[inline]
@@ -187,7 +175,7 @@ mod tests {
         task::{Context, Poll},
     };
     use tonic::codec::SingleMessageCompressionOverride;
-    use tonic::codec::{EncodeBody, HEADER_SIZE, Streaming};
+    use tonic::codec::{EncodeBody, EncodeBuffer, HEADER_SIZE, Streaming};
 
     const LEN: usize = 10000;
     // The maximum uncompressed size in bytes for a message. Set to 2MB.
@@ -493,23 +481,13 @@ mod tests {
         const ENCODE_READY: bool = true;
 
         fn encode_ready(
-            &mut self,
+            self: Pin<&mut Self>,
             item: Self::Item,
             mut buf: EncodeBuf<'_>,
         ) -> Result<(), Self::Error> {
+            let _ = self;
             buf.put(&item[..]);
             Ok(())
-        }
-
-        fn poll_encode(
-            &mut self,
-            _cx: &mut Context<'_>,
-            item: &mut Option<Self::Item>,
-            mut buf: EncodeBuf<'_>,
-        ) -> Poll<Result<(), Self::Error>> {
-            let item = item.take().expect("encoder item available");
-            buf.put(&item[..]);
-            Poll::Ready(Ok(()))
         }
 
         fn buffer_settings(&self) -> BufferSettings {
@@ -517,31 +495,60 @@ mod tests {
         }
     }
 
-    #[derive(Debug, Clone, Default)]
+    #[derive(Debug, Default)]
     struct PendingEncoder {
-        yielded: bool,
+        state: PendingEncoderState,
+    }
+
+    #[derive(Debug, Default)]
+    enum PendingEncoderState {
+        #[default]
+        Idle,
+        Pending {
+            item: Vec<u8>,
+            buf: EncodeBuffer,
+            yielded: bool,
+        },
     }
 
     impl Encoder for PendingEncoder {
         type Item = Vec<u8>;
         type Error = Status;
 
+        fn start_encode(
+            self: Pin<&mut Self>,
+            item: Self::Item,
+            buf: EncodeBuffer,
+        ) -> Result<(), Self::Error> {
+            self.get_mut().state = PendingEncoderState::Pending {
+                item,
+                buf,
+                yielded: false,
+            };
+            Ok(())
+        }
+
         fn poll_encode(
-            &mut self,
+            self: Pin<&mut Self>,
             cx: &mut Context<'_>,
-            item: &mut Option<Self::Item>,
-            mut buf: EncodeBuf<'_>,
-        ) -> Poll<Result<(), Self::Error>> {
-            if !self.yielded {
-                self.yielded = true;
+        ) -> Poll<Result<EncodeBuffer, Self::Error>> {
+            let this = self.get_mut();
+            let PendingEncoderState::Pending { yielded, .. } = &mut this.state else {
+                panic!("poll_encode without pending item");
+            };
+            if !*yielded {
+                *yielded = true;
                 cx.waker().wake_by_ref();
                 return Poll::Pending;
             }
 
-            self.yielded = false;
-            let item = item.take().expect("encoder item available");
-            buf.put(&item[..]);
-            Poll::Ready(Ok(()))
+            let PendingEncoderState::Pending { item, mut buf, .. } =
+                std::mem::take(&mut this.state)
+            else {
+                unreachable!("pending state checked above");
+            };
+            buf.as_encode_buf().put(&item[..]);
+            Poll::Ready(Ok(buf))
         }
     }
 

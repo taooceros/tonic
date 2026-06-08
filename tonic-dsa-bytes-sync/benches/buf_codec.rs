@@ -4,7 +4,7 @@ use bencher::{Bencher, benchmark_group, benchmark_main, black_box};
 use bytes::{Buf, BufMut, Bytes};
 use http_body::Body;
 use std::{
-    pin::pin,
+    pin::{Pin, pin},
     task::{Context, Poll},
 };
 use tonic::{Status, codec::BufferSettings, codec::EncodeBody, codec::EncodeBuf, codec::Encoder};
@@ -25,24 +25,13 @@ impl Encoder for SoftwareBufEncoder {
 
     #[inline]
     fn encode_ready(
-        &mut self,
+        self: Pin<&mut Self>,
         mut item: Self::Item,
         mut dst: EncodeBuf<'_>,
     ) -> Result<(), Self::Error> {
+        let _ = self;
         dst.put(&mut *item);
         Ok(())
-    }
-
-    #[inline]
-    fn poll_encode(
-        &mut self,
-        _cx: &mut Context<'_>,
-        item: &mut Option<Self::Item>,
-        mut dst: EncodeBuf<'_>,
-    ) -> Poll<Result<(), Self::Error>> {
-        let mut item = item.take().expect("encoder item available");
-        dst.put(&mut *item);
-        Poll::Ready(Ok(()))
     }
 }
 

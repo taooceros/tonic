@@ -8,6 +8,13 @@ pub struct DecodeBuf<'a> {
     len: usize,
 }
 
+/// Owned encode storage for one in-flight message.
+#[derive(Debug)]
+pub struct EncodeBuffer {
+    buf: BytesMut,
+    requires_stable_storage: bool,
+}
+
 /// A specialized buffer to encode gRPC messages into.
 #[derive(Debug)]
 pub struct EncodeBuf<'a> {
@@ -50,6 +57,30 @@ impl Buf for DecodeBuf<'_> {
         assert!(len <= self.len);
         self.len -= len;
         self.buf.copy_to_bytes(len)
+    }
+}
+impl EncodeBuffer {
+    pub(crate) fn new(buf: BytesMut) -> Self {
+        Self {
+            buf,
+            requires_stable_storage: false,
+        }
+    }
+
+    pub(crate) fn into_inner(self) -> BytesMut {
+        self.buf
+    }
+
+    #[doc(hidden)]
+    pub fn as_encode_buf(&mut self) -> EncodeBuf<'_> {
+        EncodeBuf::new_with_stable_storage_flag(&mut self.buf, &mut self.requires_stable_storage)
+    }
+
+    /// Returns true when an encoder has retained a pointer into this storage
+    /// across a pending encode operation.
+    #[inline]
+    pub fn requires_stable_storage(&self) -> bool {
+        self.requires_stable_storage
     }
 }
 

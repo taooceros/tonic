@@ -6,9 +6,9 @@
 //! memmove descriptor, returns `Poll::Pending`, and finishes the gRPC frame after
 //! the descriptor completion record reaches a terminal status.
 //!
-//! The implementation reserves final `EncodeBuf` storage, assumes that storage
-//! remains stable while `poll_encode` returns `Poll::Pending`, and commits the
-//! initialized bytes after the DSA completion record reaches a terminal status.
+//! The implementation transfers owned encode storage into the encoder before
+//! polling. Pending DSA work keeps that storage and its direct-DMA pointer inside
+//! encoder-owned state until completion.
 
 #![warn(
     missing_debug_implementations,
@@ -32,7 +32,7 @@ use std::{
     task::{Context, Poll},
 };
 use tonic::Status;
-use tonic::codec::{BufferSettings, Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
+use tonic::codec::{BufferSettings, Codec, DecodeBuf, Decoder, EncodeBuffer, Encoder};
 
 const DEFAULT_DSA_MIN_MESSAGE_BYTES: usize = 1;
 const PAGE_SIZE: usize = 4096;
@@ -291,7 +291,16 @@ impl Codec for DsaAsyncBytesCodec {
 pub struct DsaAsyncBytesEncoder {
     buffer_settings: BufferSettings,
     work_queue: Option<SharedDsaWorkQueue>,
-    pending: Option<PendingCopy>,
+    state: EncodeState,
+    #[cfg(test)]
+    yielding_cpu_for_tests: bool,
+}
+
+#[derive(Debug)]
+enum EncodeState {
+    Idle,
+    Ready(EncodeBuffer),
+    Pending(PendingCopy),
 }
 
 impl fmt::Debug for DsaAsyncBytesEncoder {
@@ -299,7 +308,7 @@ impl fmt::Debug for DsaAsyncBytesEncoder {
         f.debug_struct("DsaAsyncBytesEncoder")
             .field("buffer_settings", &self.buffer_settings)
             .field("work_queue", &self.work_queue)
-            .field("pending", &self.pending.is_some())
+            .field("state", &self.state)
             .finish()
     }
 }
@@ -336,7 +345,9 @@ impl DsaAsyncBytesEncoder {
         Self {
             buffer_settings,
             work_queue,
-            pending: None,
+            state: EncodeState::Idle,
+            #[cfg(test)]
+            yielding_cpu_for_tests: false,
         }
     }
 
@@ -346,29 +357,6 @@ impl DsaAsyncBytesEncoder {
             .as_ref()
             .is_some_and(|work_queue| work_queue.accelerates(payload_len))
     }
-
-    #[inline]
-    fn poll_pending(
-        &mut self,
-        cx: &mut Context<'_>,
-        item: &mut Option<Bytes>,
-        dst: EncodeBuf<'_>,
-    ) -> Poll<Result<(), Status>> {
-        let result = match self
-            .pending
-            .as_mut()
-            .expect("pending encode state available")
-            .poll(cx, dst)
-        {
-            Poll::Ready(result) => result,
-            Poll::Pending => return Poll::Pending,
-        };
-
-        let _pending = self.pending.take().expect("pending encode state available");
-        let _encoded_item = item.take().expect("encoder item available");
-
-        Poll::Ready(result)
-    }
 }
 
 impl Encoder for DsaAsyncBytesEncoder {
@@ -376,39 +364,71 @@ impl Encoder for DsaAsyncBytesEncoder {
     type Error = Status;
 
     #[inline]
-    fn poll_encode(
-        &mut self,
-        cx: &mut Context<'_>,
-        item: &mut Option<Self::Item>,
-        mut dst: EncodeBuf<'_>,
-    ) -> Poll<Result<(), Self::Error>> {
-        if self.pending.is_some() {
-            return self.poll_pending(cx, item, dst);
+    fn start_encode(
+        self: Pin<&mut Self>,
+        item: Self::Item,
+        mut dst: EncodeBuffer,
+    ) -> Result<(), Self::Error> {
+        let this = self.get_mut();
+        if !matches!(this.state, EncodeState::Idle) {
+            return Err(Status::internal(
+                "async dsa bytes encoder already has an in-flight encode",
+            ));
         }
 
-        let payload = item.as_ref().expect("encoder item available");
-        let payload_len = payload.len();
-        if !self.should_accelerate(payload_len) {
-            let item = item.take().expect("encoder item available");
-            dst.put(item);
-            return Poll::Ready(Ok(()));
+        let payload_len = item.len();
+
+        #[cfg(test)]
+        if this.yielding_cpu_for_tests {
+            this.state = EncodeState::Pending(PendingCopy::yielding_cpu(item, dst));
+            return Ok(());
+        }
+
+        if !this.should_accelerate(payload_len) {
+            dst.as_encode_buf().put(item);
+            this.state = EncodeState::Ready(dst);
+            return Ok(());
         }
 
         if payload_len > u32::MAX as usize {
-            let _encoded_item = item.take().expect("encoder item available");
-            return Poll::Ready(Err(Status::internal(format!(
+            return Err(Status::internal(format!(
                 "async dsa bytes encode cannot copy {payload_len} bytes; maximum DSA transfer is {} bytes",
                 u32::MAX
-            ))));
+            )));
         }
 
-        let work_queue = self
+        let work_queue = this
             .work_queue
             .as_ref()
             .expect("DSA work queue checked before encoding")
             .clone();
-        self.pending = Some(PendingCopy::dsa(work_queue, payload.clone()));
-        self.poll_pending(cx, item, dst)
+        this.state = EncodeState::Pending(PendingCopy::dsa(work_queue, item, dst));
+        Ok(())
+    }
+
+    #[inline]
+    fn poll_encode(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<EncodeBuffer, Self::Error>> {
+        let this = self.get_mut();
+        match &mut this.state {
+            EncodeState::Idle => panic!("poll_encode without pending item"),
+            EncodeState::Ready(_) => {
+                let EncodeState::Ready(buf) = std::mem::replace(&mut this.state, EncodeState::Idle)
+                else {
+                    unreachable!("ready state checked above");
+                };
+                Poll::Ready(Ok(buf))
+            }
+            EncodeState::Pending(pending) => match pending.poll(cx) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(result) => {
+                    this.state = EncodeState::Idle;
+                    Poll::Ready(result)
+                }
+            },
+        }
     }
 
     #[inline]
@@ -461,21 +481,31 @@ enum PendingCopy {
     YieldingCpu(PendingYieldingCpuCopy),
 }
 
+impl fmt::Debug for PendingCopy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PendingCopy::Dsa(_) => f.write_str("PendingCopy::Dsa"),
+            #[cfg(test)]
+            PendingCopy::YieldingCpu(_) => f.write_str("PendingCopy::YieldingCpu"),
+        }
+    }
+}
+
 impl PendingCopy {
-    fn dsa(work_queue: SharedDsaWorkQueue, source: Bytes) -> Self {
-        Self::Dsa(PendingDsaCopy::new(work_queue, source))
+    fn dsa(work_queue: SharedDsaWorkQueue, source: Bytes, buf: EncodeBuffer) -> Self {
+        Self::Dsa(PendingDsaCopy::new(work_queue, source, buf))
     }
 
     #[cfg(test)]
-    fn yielding_cpu(source: Bytes) -> Self {
-        Self::YieldingCpu(PendingYieldingCpuCopy::new(source))
+    fn yielding_cpu(source: Bytes, buf: EncodeBuffer) -> Self {
+        Self::YieldingCpu(PendingYieldingCpuCopy::new(source, buf))
     }
 
-    fn poll(&mut self, cx: &mut Context<'_>, dst: EncodeBuf<'_>) -> Poll<Result<(), Status>> {
+    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<Result<EncodeBuffer, Status>> {
         match self {
-            PendingCopy::Dsa(copy) => copy.as_mut().poll(cx, dst),
+            PendingCopy::Dsa(copy) => copy.as_mut().poll(cx),
             #[cfg(test)]
-            PendingCopy::YieldingCpu(copy) => copy.poll(cx, dst),
+            PendingCopy::YieldingCpu(copy) => copy.poll(cx),
         }
     }
 }
@@ -483,6 +513,7 @@ impl PendingCopy {
 struct PendingDsaCopy {
     work_queue: SharedDsaWorkQueue,
     source: Bytes,
+    buf: Option<EncodeBuffer>,
     dst: *mut u8,
     dst_len: usize,
     desc: DsaHwDesc,
@@ -492,17 +523,17 @@ struct PendingDsaCopy {
     _pin: PhantomPinned,
 }
 
-// SAFETY: `dst` points into the `BytesMut` allocation owned by Tonic's
-// `EncodeBody`. The direct-DMA experiment assumes that allocation remains stable
-// while the pending encode is moved between executor threads. `Drop` drains a
-// submitted descriptor before the pending state can be released.
+// SAFETY: `dst` points into the `EncodeBuffer` owned by this pending state.
+// Both the pointer and the buffer move together inside the boxed pending copy.
+// `Drop` drains a submitted descriptor before the pending state can be released.
 unsafe impl Send for PendingDsaCopy {}
 
 impl PendingDsaCopy {
-    fn new(work_queue: SharedDsaWorkQueue, source: Bytes) -> Pin<Box<Self>> {
+    fn new(work_queue: SharedDsaWorkQueue, source: Bytes, buf: EncodeBuffer) -> Pin<Box<Self>> {
         Box::pin(Self {
             work_queue,
             source,
+            buf: Some(buf),
             dst: std::ptr::null_mut(),
             dst_len: 0,
             desc: DsaHwDesc::default(),
@@ -513,19 +544,16 @@ impl PendingDsaCopy {
         })
     }
 
-    fn poll(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        mut dst: EncodeBuf<'_>,
-    ) -> Poll<Result<(), Status>> {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<EncodeBuffer, Status>> {
         let this = self.as_mut().project_mut();
 
         if !*this.submitted {
             let len = this.source.len();
-            // SAFETY: This experiment assumes Tonic's encode buffer allocation
-            // remains stable while `poll_encode` returns `Pending`. The pending
-            // state stores the pointer only until completion and advances the
-            // same reservation exactly once on success.
+            let buf = this.buf.as_mut().expect("pending encode buffer available");
+            let mut dst = buf.as_encode_buf();
+            // SAFETY: The pending state owns the encode buffer until completion.
+            // The direct-DMA pointer is retained only while this pending state is
+            // alive, and the matching commit happens exactly once on success.
             let dst_ptr = unsafe { dst.reserve_uninit_slice_for_pending(len) };
             touch_pages_for_dsa(this.source.as_ptr(), dst_ptr, len);
 
@@ -551,14 +579,16 @@ impl PendingDsaCopy {
             &this.work_queue.config.device_path,
         ) {
             Ok(()) => {
+                let mut buf = this.buf.take().expect("pending encode buffer available");
                 // SAFETY: DSA completion with success means the descriptor has
                 // initialized the exact bytes in the reservation made on the
                 // first poll. This is the single matching commit for that
                 // reservation.
                 unsafe {
-                    dst.advance_reserved_uninit_slice(*this.dst_len);
+                    buf.as_encode_buf()
+                        .advance_reserved_uninit_slice(*this.dst_len);
                 }
-                Poll::Ready(Ok(()))
+                Poll::Ready(Ok(buf))
             }
             Err(status) => Poll::Ready(Err(status)),
         }
@@ -577,13 +607,13 @@ impl PendingDsaCopy {
 
     fn project_mut(self: Pin<&mut Self>) -> PendingDsaCopyProjection<'_> {
         // SAFETY: `PendingDsaCopy` is pinned in a `Box`, and this method never
-        // moves any field out of the pinned allocation. Mutable references are
-        // used only to update descriptor/completion bytes and scalar state in
-        // place while their addresses remain stable.
+        // moves any field out of the pinned allocation except through explicit
+        // `Option::take` on the owned encode buffer after hardware completion.
         let this = unsafe { self.get_unchecked_mut() };
         PendingDsaCopyProjection {
             work_queue: &this.work_queue,
             source: &this.source,
+            buf: &mut this.buf,
             dst: &mut this.dst,
             dst_len: &mut this.dst_len,
             desc: &mut this.desc,
@@ -603,6 +633,7 @@ impl Drop for PendingDsaCopy {
 struct PendingDsaCopyProjection<'a> {
     work_queue: &'a DsaWorkQueue,
     source: &'a Bytes,
+    buf: &'a mut Option<EncodeBuffer>,
     dst: &'a mut *mut u8,
     dst_len: &'a mut usize,
     desc: &'a mut DsaHwDesc,
@@ -614,27 +645,31 @@ struct PendingDsaCopyProjection<'a> {
 #[cfg(test)]
 struct PendingYieldingCpuCopy {
     source: Option<Bytes>,
+    buf: Option<EncodeBuffer>,
     yielded: bool,
 }
 
 #[cfg(test)]
 impl PendingYieldingCpuCopy {
-    fn new(source: Bytes) -> Self {
+    fn new(source: Bytes, buf: EncodeBuffer) -> Self {
         Self {
             source: Some(source),
+            buf: Some(buf),
             yielded: false,
         }
     }
 
-    fn poll(&mut self, cx: &mut Context<'_>, mut dst: EncodeBuf<'_>) -> Poll<Result<(), Status>> {
+    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<Result<EncodeBuffer, Status>> {
         if !self.yielded {
             self.yielded = true;
             cx.waker().wake_by_ref();
             return Poll::Pending;
         }
 
-        dst.put(self.source.take().expect("pending source available"));
-        Poll::Ready(Ok(()))
+        let mut buf = self.buf.take().expect("pending encode buffer available");
+        buf.as_encode_buf()
+            .put(self.source.take().expect("pending source available"));
+        Poll::Ready(Ok(buf))
     }
 }
 
@@ -695,12 +730,9 @@ mod tests {
             Self {
                 buffer_settings,
                 work_queue: None,
-                pending: None,
+                state: EncodeState::Idle,
+                yielding_cpu_for_tests: true,
             }
-        }
-
-        fn start_yielding_cpu_for_tests(&mut self, source: Bytes) {
-            self.pending = Some(PendingCopy::yielding_cpu(source));
         }
     }
 
@@ -746,8 +778,7 @@ mod tests {
         let payload = Bytes::from_static(b"async payload");
         let expected_payload = payload.clone();
         let source = tokio_stream::iter(std::iter::once(Ok::<_, Status>(payload.clone())));
-        let mut encoder = DsaAsyncBytesEncoder::yielding_cpu_for_tests(BufferSettings::default());
-        encoder.start_yielding_cpu_for_tests(payload);
+        let encoder = DsaAsyncBytesEncoder::yielding_cpu_for_tests(BufferSettings::default());
         let mut body = pin!(EncodeBody::new_client(encoder, source, None, None));
         let waker = std::task::Waker::noop();
         let mut cx = Context::from_waker(waker);

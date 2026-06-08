@@ -12,8 +12,8 @@ use super::{
 };
 use bytes::{Buf, BufMut, Bytes};
 use idxd_rust::DsaHwDesc;
-use std::fmt;
 use std::task::{Context, Poll};
+use std::{fmt, pin::Pin};
 use tonic::Status;
 use tonic::codec::{BufferSettings, Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
 
@@ -205,19 +205,12 @@ impl Encoder for DsaSyncBufEncoder {
     const ENCODE_READY: bool = true;
 
     #[inline]
-    fn encode_ready(&mut self, item: Self::Item, dst: EncodeBuf<'_>) -> Result<(), Self::Error> {
-        self.encode_item(item, dst)
-    }
-
-    #[inline]
-    fn poll_encode(
-        &mut self,
-        _cx: &mut Context<'_>,
-        item: &mut Option<Self::Item>,
+    fn encode_ready(
+        self: Pin<&mut Self>,
+        item: Self::Item,
         dst: EncodeBuf<'_>,
-    ) -> Poll<Result<(), Self::Error>> {
-        let item = item.take().expect("encoder item available");
-        Poll::Ready(self.encode_item(item, dst))
+    ) -> Result<(), Self::Error> {
+        self.get_mut().encode_item(item, dst)
     }
 
     #[inline]

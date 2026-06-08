@@ -6,6 +6,7 @@ use bytes::{Buf, BufMut};
 use serde::{Deserialize, Serialize};
 use std::{
     marker::PhantomData,
+    pin::Pin,
     task::{Context, Poll},
 };
 use tonic::{
@@ -32,20 +33,13 @@ impl<T: serde::Serialize> Encoder for JsonEncoder<T> {
 
     const ENCODE_READY: bool = true;
 
-    fn encode_ready(&mut self, item: Self::Item, buf: EncodeBuf<'_>) -> Result<(), Self::Error> {
-        serde_json::to_writer(buf.writer(), &item).map_err(|e| Status::internal(e.to_string()))
-    }
-
-    fn poll_encode(
-        &mut self,
-        _cx: &mut Context<'_>,
-        item: &mut Option<Self::Item>,
+    fn encode_ready(
+        self: Pin<&mut Self>,
+        item: Self::Item,
         buf: EncodeBuf<'_>,
-    ) -> Poll<Result<(), Self::Error>> {
-        let item = item.take().expect("encoder item available");
-        Poll::Ready(
-            serde_json::to_writer(buf.writer(), &item).map_err(|e| Status::internal(e.to_string())),
-        )
+    ) -> Result<(), Self::Error> {
+        let _ = self;
+        serde_json::to_writer(buf.writer(), &item).map_err(|e| Status::internal(e.to_string()))
     }
 }
 

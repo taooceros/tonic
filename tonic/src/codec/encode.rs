@@ -1,7 +1,9 @@
 use super::compression::{
     CompressionEncoding, CompressionSettings, SingleMessageCompressionOverride, compress,
 };
-use super::{BufferSettings, DEFAULT_MAX_SEND_MESSAGE_SIZE, EncodeBuf, Encoder, HEADER_SIZE};
+use super::{
+    BufferSettings, DEFAULT_MAX_SEND_MESSAGE_SIZE, EncodeBuf, EncodeBuffer, Encoder, HEADER_SIZE,
+};
 use crate::Status;
 use bytes::{BufMut, Bytes, BytesMut};
 use http::HeaderMap;
@@ -22,22 +24,15 @@ where
 {
     #[pin]
     source: Fuse<U>,
+    #[pin]
     encoder: T,
     compression_encoding: Option<CompressionEncoding>,
     max_message_size: Option<usize>,
     buffer_settings: BufferSettings,
     buf: BytesMut,
     uncompression_buf: BytesMut,
-    in_flight: Option<InFlightEncode<T::Item>>,
+    in_flight_offset: Option<usize>,
     error: Option<Status>,
-}
-
-#[derive(Debug)]
-struct InFlightEncode<I> {
-    item: Option<I>,
-    offset: usize,
-    compression_encoding: Option<CompressionEncoding>,
-    requires_stable_encode_buf: bool,
 }
 
 impl<T, U> EncodedBytes<T, U>
@@ -77,7 +72,7 @@ where
             buffer_settings,
             buf,
             uncompression_buf,
-            in_flight: None,
+            in_flight_offset: None,
             error: None,
         }
     }
@@ -85,7 +80,7 @@ where
     fn start_encoding(mut self: Pin<&mut Self>, item: T::Item) -> Result<bool, Status> {
         let (result, offset, compression_encoding) = {
             let this = self.as_mut().project();
-            debug_assert!(this.in_flight.is_none());
+            debug_assert!(this.in_flight_offset.is_none());
 
             let offset = this.buf.len();
             let compression_encoding = *this.compression_encoding;
@@ -95,26 +90,27 @@ where
                 this.buf.advance_mut(HEADER_SIZE);
             }
 
-            let dst = if compression_encoding.is_some() {
-                this.uncompression_buf.clear();
-                EncodeBuf::new(this.uncompression_buf)
-            } else {
-                EncodeBuf::new(this.buf)
-            };
-
             if T::ENCODE_READY {
+                let dst = if compression_encoding.is_some() {
+                    this.uncompression_buf.clear();
+                    EncodeBuf::new(this.uncompression_buf)
+                } else {
+                    EncodeBuf::new(this.buf)
+                };
                 (
                     this.encoder.encode_ready(item, dst),
                     offset,
                     compression_encoding,
                 )
             } else {
-                *this.in_flight = Some(InFlightEncode {
-                    item: Some(item),
-                    offset,
-                    compression_encoding,
-                    requires_stable_encode_buf: false,
-                });
+                let dst = if compression_encoding.is_some() {
+                    this.uncompression_buf.clear();
+                    EncodeBuffer::new(std::mem::take(this.uncompression_buf))
+                } else {
+                    EncodeBuffer::new(std::mem::take(this.buf))
+                };
+                this.encoder.start_encode(item, dst)?;
+                *this.in_flight_offset = Some(offset);
                 return Ok(false);
             }
         };
@@ -122,7 +118,6 @@ where
         let this = self.as_mut().project();
         finish_encode_result(
             result,
-            None::<T::Item>,
             this.buf,
             this.uncompression_buf,
             this.buffer_settings,
@@ -135,41 +130,34 @@ where
 
     #[inline]
     fn poll_encode(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Status>> {
+        if self.as_ref().project_ref().in_flight_offset.is_none() {
+            return Poll::Ready(Ok(()));
+        }
+
         let result = {
             let this = self.as_mut().project();
-            let Some(in_flight) = this.in_flight.as_mut() else {
-                return Poll::Ready(Ok(()));
-            };
-
-            let dst = if in_flight.compression_encoding.is_some() {
-                EncodeBuf::new_with_stable_storage_flag(
-                    this.uncompression_buf,
-                    &mut in_flight.requires_stable_encode_buf,
-                )
-            } else {
-                EncodeBuf::new_with_stable_storage_flag(
-                    this.buf,
-                    &mut in_flight.requires_stable_encode_buf,
-                )
-            };
-
-            ready!(this.encoder.poll_encode(cx, &mut in_flight.item, dst))
+            ready!(this.encoder.poll_encode(cx))
         };
 
         let this = self.as_mut().project();
-        let InFlightEncode {
-            item,
-            offset,
-            compression_encoding,
-            requires_stable_encode_buf: _,
-        } = this
-            .in_flight
+        let offset = this
+            .in_flight_offset
             .take()
-            .expect("encode completion must have in-flight state");
+            .expect("encode completion must have in-flight offset");
+        let compression_encoding = *this.compression_encoding;
+
+        let encode_buffer = match result {
+            Ok(encode_buffer) => encode_buffer,
+            Err(status) => return Poll::Ready(Err(status)),
+        };
+
+        if compression_encoding.is_some() {
+            *this.uncompression_buf = encode_buffer.into_inner();
+        } else {
+            *this.buf = encode_buffer.into_inner();
+        }
 
         finish_poll_encode(
-            result,
-            item,
             this.buf,
             this.uncompression_buf,
             this.buffer_settings,
@@ -177,22 +165,6 @@ where
             offset,
             compression_encoding,
         )
-    }
-
-    #[inline]
-    fn take_buf_before_in_flight(mut self: Pin<&mut Self>) -> Option<Bytes> {
-        let this = self.as_mut().project();
-        let in_flight = this.in_flight.as_mut()?;
-        if in_flight.requires_stable_encode_buf {
-            return None;
-        }
-        if in_flight.offset == 0 {
-            return None;
-        }
-
-        let offset = in_flight.offset;
-        in_flight.offset = 0;
-        Some(this.buf.split_to(offset).freeze())
     }
 
     #[inline]
@@ -206,9 +178,8 @@ where
     }
 }
 #[inline]
-fn finish_encode_result<I>(
+fn finish_encode_result(
     result: Result<(), Status>,
-    item: Option<I>,
     buf: &mut BytesMut,
     uncompression_buf: &mut BytesMut,
     buffer_settings: &BufferSettings,
@@ -217,11 +188,6 @@ fn finish_encode_result<I>(
     compression_encoding: Option<CompressionEncoding>,
 ) -> Result<(), Status> {
     result.map_err(|err| Status::internal(format!("Error encoding: {err}")))?;
-    if item.is_some() {
-        return Err(Status::internal(
-            "encoder completed without consuming the item",
-        ));
-    }
 
     finish_encoded_item(
         buf,
@@ -234,9 +200,7 @@ fn finish_encode_result<I>(
 }
 
 #[inline]
-fn finish_poll_encode<I>(
-    result: Result<(), Status>,
-    item: Option<I>,
+fn finish_poll_encode(
     buf: &mut BytesMut,
     uncompression_buf: &mut BytesMut,
     buffer_settings: &BufferSettings,
@@ -245,8 +209,7 @@ fn finish_poll_encode<I>(
     compression_encoding: Option<CompressionEncoding>,
 ) -> Poll<Result<(), Status>> {
     Poll::Ready(finish_encode_result(
-        result,
-        item,
+        Ok(()),
         buf,
         uncompression_buf,
         buffer_settings,
@@ -294,17 +257,11 @@ where
     #[inline]
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         loop {
-            if self.as_ref().project_ref().in_flight.is_some() {
+            if self.as_ref().project_ref().in_flight_offset.is_some() {
                 match self.as_mut().poll_encode(cx) {
                     Poll::Ready(Ok(())) => {}
                     Poll::Ready(Err(status)) => return Poll::Ready(Some(Err(status))),
-                    Poll::Pending => {
-                        if let Some(bytes) = self.as_mut().take_buf_before_in_flight() {
-                            return Poll::Ready(Some(Ok(bytes)));
-                        }
-
-                        return Poll::Pending;
-                    }
+                    Poll::Pending => return Poll::Pending,
                 }
             }
 

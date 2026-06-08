@@ -25,6 +25,7 @@
 use bytes::{Buf, BufMut};
 use std::{
     marker::PhantomData,
+    pin::Pin,
     task::{Context, Poll},
 };
 use tonic::{
@@ -88,10 +89,11 @@ impl<T: Message> Encoder for ProtoEncoder<T> {
     const ENCODE_READY: bool = true;
 
     fn encode_ready(
-        &mut self,
+        self: Pin<&mut Self>,
         item: Self::Item,
         mut buf: EncodeBuf<'_>,
     ) -> Result<(), Self::Error> {
+        let _ = self;
         // The protobuf library doesn't support serializing into a user-provided
         // buffer. Instead, it allocates its own buffer, resulting in an extra
         // copy and allocation.
@@ -99,24 +101,6 @@ impl<T: Message> Encoder for ProtoEncoder<T> {
         item.serialize()
             .map_err(from_decode_error)
             .map(|serialized| buf.put_slice(serialized.as_slice()))
-    }
-
-    fn poll_encode(
-        &mut self,
-        _cx: &mut Context<'_>,
-        item: &mut Option<Self::Item>,
-        mut buf: EncodeBuf<'_>,
-    ) -> Poll<Result<(), Self::Error>> {
-        let item = item.take().expect("encoder item available");
-        // The protobuf library doesn't support serializing into a user-provided
-        // buffer. Instead, it allocates its own buffer, resulting in an extra
-        // copy and allocation.
-        // TODO: #2345 - Find a way to avoid this extra copy.
-        let result = item
-            .serialize()
-            .map_err(from_decode_error)
-            .map(|serialized| buf.put_slice(serialized.as_slice()));
-        Poll::Ready(result)
     }
 }
 

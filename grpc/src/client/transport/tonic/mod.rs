@@ -568,23 +568,13 @@ impl Encoder for BytesEncoder {
     const ENCODE_READY: bool = true;
 
     fn encode_ready(
-        &mut self,
+        self: Pin<&mut Self>,
         item: Self::Item,
         mut dst: EncodeBuf<'_>,
     ) -> Result<(), Self::Error> {
+        let _ = self;
         dst.put_slice(&item);
         Ok(())
-    }
-
-    fn poll_encode(
-        &mut self,
-        _cx: &mut Context<'_>,
-        item: &mut Option<Self::Item>,
-        mut dst: EncodeBuf<'_>,
-    ) -> Poll<Result<(), Self::Error>> {
-        let item = item.take().expect("encoder item available");
-        dst.put_slice(&item);
-        Poll::Ready(Ok(()))
     }
 }
 
@@ -597,23 +587,13 @@ impl Encoder for BufEncoder {
     const ENCODE_READY: bool = true;
 
     fn encode_ready(
-        &mut self,
+        self: Pin<&mut Self>,
         mut item: Self::Item,
         mut dst: EncodeBuf<'_>,
     ) -> Result<(), Self::Error> {
+        let _ = self;
         dst.put(&mut *item);
         Ok(())
-    }
-
-    fn poll_encode(
-        &mut self,
-        _cx: &mut Context<'_>,
-        item: &mut Option<Self::Item>,
-        mut dst: EncodeBuf<'_>,
-    ) -> Poll<Result<(), Self::Error>> {
-        let mut item = item.take().expect("encoder item available");
-        dst.put(&mut *item);
-        Poll::Ready(Ok(()))
     }
 }
 

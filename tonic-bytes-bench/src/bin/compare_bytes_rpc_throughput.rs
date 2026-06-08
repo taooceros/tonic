@@ -176,21 +176,14 @@ impl Encoder for StandardBytesEncoder {
     const ENCODE_READY: bool = true;
 
     #[inline]
-    fn encode_ready(&mut self, mut item: Self::Item, mut dst: EncodeBuf<'_>) -> Result<(), Status> {
+    fn encode_ready(
+        self: Pin<&mut Self>,
+        mut item: Self::Item,
+        mut dst: EncodeBuf<'_>,
+    ) -> Result<(), Status> {
+        let _ = self;
         dst.put(&mut *item);
         Ok(())
-    }
-
-    #[inline]
-    fn poll_encode(
-        &mut self,
-        _cx: &mut Context<'_>,
-        item: &mut Option<Self::Item>,
-        mut dst: EncodeBuf<'_>,
-    ) -> Poll<Result<(), Status>> {
-        let mut item = item.take().expect("encoder item available");
-        dst.put(&mut *item);
-        Poll::Ready(Ok(()))
     }
 
     #[inline]

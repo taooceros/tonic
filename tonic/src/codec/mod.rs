@@ -9,10 +9,11 @@ mod encode;
 use crate::Status;
 use std::{
     io,
+    pin::Pin,
     task::{Context, Poll},
 };
 
-pub use self::buffer::{DecodeBuf, EncodeBuf};
+pub use self::buffer::{DecodeBuf, EncodeBuf, EncodeBuffer};
 pub use self::compression::{CompressionEncoding, EnabledCompressionEncodings};
 pub use self::decode::Streaming;
 pub use self::encode::{EncodeBody, EncodedBytes};
@@ -141,22 +142,46 @@ pub trait Encoder {
     /// this method and complete without yielding.
     #[inline]
     #[doc(hidden)]
-    fn encode_ready(&mut self, item: Self::Item, _dst: EncodeBuf<'_>) -> Result<(), Self::Error> {
+    fn encode_ready(
+        self: Pin<&mut Self>,
+        item: Self::Item,
+        _dst: EncodeBuf<'_>,
+    ) -> Result<(), Self::Error> {
         let _ = item;
         unreachable!("ENCODE_READY encoders must override encode_ready")
     }
 
-    /// Polls encoding of one message into the provided buffer.
+    /// Starts encoding one message into owned encode storage.
     ///
-    /// `item` contains the message until encoding completes. Implementations
-    /// must leave it in place when returning [`Poll::Pending`] and take it
-    /// before returning [`Poll::Ready`].
+    /// Implementations that return before completion must keep all in-flight
+    /// item, buffer, and cancellation state inside `self` until
+    /// [`Self::poll_encode`] returns the completed buffer.
+    #[doc(hidden)]
+    fn start_encode(
+        self: Pin<&mut Self>,
+        item: Self::Item,
+        dst: EncodeBuffer,
+    ) -> Result<(), Self::Error> {
+        let _ = item;
+        let _ = dst;
+        unreachable!("async encoders must override start_encode")
+    }
+
+    /// Polls encoding of the message most recently passed to
+    /// [`Self::start_encode`].
+    ///
+    /// This mirrors [`http_body::Body::poll_frame`]: the encoder owns all
+    /// in-flight state, and polling takes only pinned encoder state plus the
+    /// task context.
+    #[doc(hidden)]
     fn poll_encode(
-        &mut self,
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        item: &mut Option<Self::Item>,
-        dst: EncodeBuf<'_>,
-    ) -> Poll<Result<(), Self::Error>>;
+    ) -> Poll<Result<EncodeBuffer, Self::Error>> {
+        let _ = self;
+        let _ = cx;
+        unreachable!("async encoders must override poll_encode")
+    }
 
     /// Controls how tonic creates and expands encode buffers.
     fn buffer_settings(&self) -> BufferSettings {
