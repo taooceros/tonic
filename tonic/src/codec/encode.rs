@@ -2,7 +2,7 @@ use super::compression::{
     CompressionEncoding, CompressionSettings, SingleMessageCompressionOverride, compress,
 };
 use super::{
-    BufferSettings, DEFAULT_MAX_SEND_MESSAGE_SIZE, EncodeBuf, EncodeBuffer, Encoder, HEADER_SIZE,
+    AsyncEncode, BufferSettings, DEFAULT_MAX_SEND_MESSAGE_SIZE, EncodeBuffer, Encoder, HEADER_SIZE,
 };
 use crate::Status;
 use bytes::{BufMut, Bytes, BytesMut};
@@ -31,6 +31,8 @@ where
     buffer_settings: BufferSettings,
     buf: BytesMut,
     uncompression_buf: BytesMut,
+    #[pin]
+    in_flight: Option<T::Encode>,
     in_flight_offset: Option<usize>,
     error: Option<Status>,
 }
@@ -72,99 +74,81 @@ where
             buffer_settings,
             buf,
             uncompression_buf,
+            in_flight: None,
             in_flight_offset: None,
             error: None,
         }
     }
     #[inline]
-    fn start_encoding(mut self: Pin<&mut Self>, item: T::Item) -> Result<bool, Status> {
-        let (result, offset, compression_encoding) = {
-            let this = self.as_mut().project();
-            debug_assert!(this.in_flight_offset.is_none());
+    fn start_encoding(mut self: Pin<&mut Self>, item: T::Item) -> Result<(), Status> {
+        let mut this = self.as_mut().project();
+        debug_assert!(this.in_flight.as_ref().get_ref().is_none());
+        debug_assert!(this.in_flight_offset.is_none());
 
-            let offset = this.buf.len();
-            let compression_encoding = *this.compression_encoding;
+        let offset = this.buf.len();
+        let compression_encoding = *this.compression_encoding;
 
-            this.buf.reserve(HEADER_SIZE);
-            unsafe {
-                this.buf.advance_mut(HEADER_SIZE);
-            }
+        this.buf.reserve(HEADER_SIZE);
+        unsafe {
+            this.buf.advance_mut(HEADER_SIZE);
+        }
 
-            if T::ENCODE_READY {
-                let dst = if compression_encoding.is_some() {
-                    this.uncompression_buf.clear();
-                    EncodeBuf::new(this.uncompression_buf)
-                } else {
-                    EncodeBuf::new(this.buf)
-                };
-                (
-                    this.encoder.encode_ready(item, dst),
-                    offset,
-                    compression_encoding,
-                )
-            } else {
-                let dst = if compression_encoding.is_some() {
-                    this.uncompression_buf.clear();
-                    EncodeBuffer::new(std::mem::take(this.uncompression_buf))
-                } else {
-                    EncodeBuffer::new(std::mem::take(this.buf))
-                };
-                this.encoder.start_encode(item, dst)?;
-                *this.in_flight_offset = Some(offset);
-                return Ok(false);
-            }
+        let dst = if compression_encoding.is_some() {
+            this.uncompression_buf.clear();
+            EncodeBuffer::new(std::mem::take(this.uncompression_buf))
+        } else {
+            EncodeBuffer::new(std::mem::take(this.buf))
         };
 
-        let this = self.as_mut().project();
-        finish_encode_result(
-            result,
-            this.buf,
-            this.uncompression_buf,
-            this.buffer_settings,
-            this.max_message_size,
-            offset,
-            compression_encoding,
-        )?;
-        Ok(true)
+        let encode = this.encoder.encode(item, dst)?;
+        this.in_flight.set(Some(encode));
+        *this.in_flight_offset = Some(offset);
+
+        Ok(())
     }
 
     #[inline]
     fn poll_encode(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Status>> {
-        if self.as_ref().project_ref().in_flight_offset.is_none() {
+        if self
+            .as_ref()
+            .project_ref()
+            .in_flight
+            .as_ref()
+            .get_ref()
+            .is_none()
+        {
             return Poll::Ready(Ok(()));
         }
 
         let result = {
             let this = self.as_mut().project();
-            ready!(this.encoder.poll_encode(cx))
+            let encode = this
+                .in_flight
+                .as_pin_mut()
+                .expect("encode operation must be in-flight");
+            ready!(encode.poll_encode(cx))
         };
 
-        let this = self.as_mut().project();
+        let mut this = self.as_mut().project();
+        this.in_flight.set(None);
         let offset = this
             .in_flight_offset
             .take()
             .expect("encode completion must have in-flight offset");
         let compression_encoding = *this.compression_encoding;
 
-        let encode_buffer = match result {
-            Ok(encode_buffer) => encode_buffer,
-            Err(status) => return Poll::Ready(Err(status)),
-        };
-
-        if compression_encoding.is_some() {
-            *this.uncompression_buf = encode_buffer.into_inner();
-        } else {
-            *this.buf = encode_buffer.into_inner();
+        match result {
+            Ok(encode_buffer) => Poll::Ready(finish_encode_buffer(
+                encode_buffer,
+                this.buf,
+                this.uncompression_buf,
+                this.buffer_settings,
+                this.max_message_size,
+                offset,
+                compression_encoding,
+            )),
+            Err(status) => Poll::Ready(Err(status)),
         }
-
-        finish_poll_encode(
-            this.buf,
-            this.uncompression_buf,
-            this.buffer_settings,
-            this.max_message_size,
-            offset,
-            compression_encoding,
-        )
     }
 
     #[inline]
@@ -178,8 +162,8 @@ where
     }
 }
 #[inline]
-fn finish_encode_result(
-    result: Result<(), Status>,
+fn finish_encode_buffer(
+    encode_buffer: EncodeBuffer,
     buf: &mut BytesMut,
     uncompression_buf: &mut BytesMut,
     buffer_settings: &BufferSettings,
@@ -187,7 +171,11 @@ fn finish_encode_result(
     offset: usize,
     compression_encoding: Option<CompressionEncoding>,
 ) -> Result<(), Status> {
-    result.map_err(|err| Status::internal(format!("Error encoding: {err}")))?;
+    if compression_encoding.is_some() {
+        *uncompression_buf = encode_buffer.into_inner();
+    } else {
+        *buf = encode_buffer.into_inner();
+    }
 
     finish_encoded_item(
         buf,
@@ -197,26 +185,6 @@ fn finish_encode_result(
         offset,
         compression_encoding,
     )
-}
-
-#[inline]
-fn finish_poll_encode(
-    buf: &mut BytesMut,
-    uncompression_buf: &mut BytesMut,
-    buffer_settings: &BufferSettings,
-    max_message_size: &Option<usize>,
-    offset: usize,
-    compression_encoding: Option<CompressionEncoding>,
-) -> Poll<Result<(), Status>> {
-    Poll::Ready(finish_encode_result(
-        Ok(()),
-        buf,
-        uncompression_buf,
-        buffer_settings,
-        max_message_size,
-        offset,
-        compression_encoding,
-    ))
 }
 
 #[inline]
@@ -257,7 +225,14 @@ where
     #[inline]
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         loop {
-            if self.as_ref().project_ref().in_flight_offset.is_some() {
+            if self
+                .as_ref()
+                .project_ref()
+                .in_flight
+                .as_ref()
+                .get_ref()
+                .is_some()
+            {
                 match self.as_mut().poll_encode(cx) {
                     Poll::Ready(Ok(())) => {}
                     Poll::Ready(Err(status)) => return Poll::Ready(Some(Err(status))),
@@ -293,14 +268,8 @@ where
                 }
             };
 
-            match self.as_mut().start_encoding(item) {
-                Ok(true) => {
-                    if let Some(bytes) = self.as_mut().take_buf_if_over_threshold() {
-                        return Poll::Ready(Some(Ok(bytes)));
-                    }
-                }
-                Ok(false) => {}
-                Err(status) => return Poll::Ready(Some(Err(status))),
+            if let Err(status) = self.as_mut().start_encoding(item) {
+                return Poll::Ready(Some(Err(status)));
             }
         }
     }

@@ -85,13 +85,6 @@ impl EncodeBuffer {
 }
 
 impl<'a> EncodeBuf<'a> {
-    pub(crate) fn new(buf: &'a mut BytesMut) -> Self {
-        EncodeBuf {
-            buf,
-            requires_stable_storage: None,
-        }
-    }
-
     pub(crate) fn new_with_stable_storage_flag(
         buf: &'a mut BytesMut,
         requires_stable_storage: &'a mut bool,
@@ -263,8 +256,8 @@ mod tests {
 
     #[test]
     fn encode_buf() {
-        let mut bytes = BytesMut::with_capacity(100);
-        let mut buf = EncodeBuf::new(&mut bytes);
+        let mut storage = EncodeBuffer::new(BytesMut::with_capacity(100));
+        let mut buf = storage.as_encode_buf();
 
         let initial = buf.remaining_mut();
         unsafe { buf.advance_mut(20) };
@@ -276,8 +269,8 @@ mod tests {
 
     #[test]
     fn encode_buf_put_uninit_slice_with_advances_only_on_success() {
-        let mut bytes = BytesMut::with_capacity(16);
-        let mut buf = EncodeBuf::new(&mut bytes);
+        let mut storage = EncodeBuffer::new(BytesMut::with_capacity(16));
+        let mut buf = storage.as_encode_buf();
 
         // SAFETY: The closure initializes exactly the requested 3 bytes and
         // returns success, so advancing the readable length is valid.

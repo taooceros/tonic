@@ -58,8 +58,9 @@ use tonic::client::GrpcService;
 use tonic::codec::Codec;
 use tonic::codec::DecodeBuf;
 use tonic::codec::Decoder;
-use tonic::codec::EncodeBuf;
+use tonic::codec::EncodeBuffer;
 use tonic::codec::Encoder;
+use tonic::codec::ReadyEncode;
 use tonic::metadata::MetadataMap as TonicMeta;
 use tower::ServiceBuilder;
 use tower::buffer::Buffer;
@@ -564,17 +565,16 @@ pub struct BytesEncoder {}
 impl Encoder for BytesEncoder {
     type Item = Bytes;
     type Error = TonicStatus;
+    type Encode = ReadyEncode<TonicStatus>;
 
-    const ENCODE_READY: bool = true;
-
-    fn encode_ready(
+    fn encode(
         self: Pin<&mut Self>,
         item: Self::Item,
-        mut dst: EncodeBuf<'_>,
-    ) -> Result<(), Self::Error> {
+        mut dst: EncodeBuffer,
+    ) -> Result<Self::Encode, Self::Error> {
         let _ = self;
-        dst.put_slice(&item);
-        Ok(())
+        dst.as_encode_buf().put_slice(&item);
+        Ok(ReadyEncode::new(dst))
     }
 }
 
@@ -583,17 +583,16 @@ pub struct BufEncoder {}
 impl Encoder for BufEncoder {
     type Item = Box<dyn Buf + Send + Sync>;
     type Error = TonicStatus;
+    type Encode = ReadyEncode<TonicStatus>;
 
-    const ENCODE_READY: bool = true;
-
-    fn encode_ready(
+    fn encode(
         self: Pin<&mut Self>,
         mut item: Self::Item,
-        mut dst: EncodeBuf<'_>,
-    ) -> Result<(), Self::Error> {
+        mut dst: EncodeBuffer,
+    ) -> Result<Self::Encode, Self::Error> {
         let _ = self;
-        dst.put(&mut *item);
-        Ok(())
+        dst.as_encode_buf().put(&mut *item);
+        Ok(ReadyEncode::new(dst))
     }
 }
 

@@ -9,6 +9,7 @@ mod encode;
 use crate::Status;
 use std::{
     io,
+    marker::PhantomData,
     pin::Pin,
     task::{Context, Poll},
 };
@@ -123,7 +124,7 @@ pub trait Codec {
     fn decoder(&mut self) -> Self::Decoder;
 }
 
-/// Encodes gRPC message types
+/// Encodes gRPC message types.
 pub trait Encoder {
     /// The type that is encoded.
     type Item;
@@ -133,59 +134,73 @@ pub trait Encoder {
     /// The type of unrecoverable frame encoding errors.
     type Error: From<io::Error>;
 
-    #[doc(hidden)]
-    const ENCODE_READY: bool = false;
+    /// The owned operation that completes one message encode.
+    type Encode: AsyncEncode<Error = Self::Error> + Send + 'static;
 
-    /// Encodes one message immediately.
+    /// Encodes one message into owned encode storage.
     ///
-    /// Implementations that set [`Self::ENCODE_READY`] to `true` must override
-    /// this method and complete without yielding.
-    #[inline]
-    #[doc(hidden)]
-    fn encode_ready(
-        self: Pin<&mut Self>,
-        item: Self::Item,
-        _dst: EncodeBuf<'_>,
-    ) -> Result<(), Self::Error> {
-        let _ = item;
-        unreachable!("ENCODE_READY encoders must override encode_ready")
-    }
-
-    /// Starts encoding one message into owned encode storage.
-    ///
-    /// Implementations that return before completion must keep all in-flight
-    /// item, buffer, and cancellation state inside `self` until
-    /// [`Self::poll_encode`] returns the completed buffer.
-    #[doc(hidden)]
-    fn start_encode(
+    /// Synchronous encoders should write the payload immediately and return
+    /// [`ReadyEncode`]. Asynchronous encoders should return an owned operation
+    /// that keeps all item, buffer, and cancellation state until
+    /// [`AsyncEncode::poll_encode`] returns the completed buffer.
+    fn encode(
         self: Pin<&mut Self>,
         item: Self::Item,
         dst: EncodeBuffer,
-    ) -> Result<(), Self::Error> {
-        let _ = item;
-        let _ = dst;
-        unreachable!("async encoders must override start_encode")
-    }
-
-    /// Polls encoding of the message most recently passed to
-    /// [`Self::start_encode`].
-    ///
-    /// This mirrors [`http_body::Body::poll_frame`]: the encoder owns all
-    /// in-flight state, and polling takes only pinned encoder state plus the
-    /// task context.
-    #[doc(hidden)]
-    fn poll_encode(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<EncodeBuffer, Self::Error>> {
-        let _ = self;
-        let _ = cx;
-        unreachable!("async encoders must override poll_encode")
-    }
+    ) -> Result<Self::Encode, Self::Error>;
 
     /// Controls how tonic creates and expands encode buffers.
     fn buffer_settings(&self) -> BufferSettings {
         BufferSettings::default()
+    }
+}
+
+/// Owned state for one in-flight message encode.
+pub trait AsyncEncode {
+    /// The type of encoding errors.
+    type Error: From<io::Error>;
+
+    /// Polls this message encode to completion.
+    fn poll_encode(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<EncodeBuffer, Self::Error>>;
+}
+
+/// An immediately-complete encode operation for synchronous encoders.
+#[derive(Debug)]
+pub struct ReadyEncode<E> {
+    buffer: Option<EncodeBuffer>,
+    _marker: PhantomData<fn() -> E>,
+}
+
+impl<E> ReadyEncode<E> {
+    /// Creates a ready encode operation containing the completed buffer.
+    pub fn new(buffer: EncodeBuffer) -> Self {
+        Self {
+            buffer: Some(buffer),
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<E> Unpin for ReadyEncode<E> {}
+
+impl<E> AsyncEncode for ReadyEncode<E>
+where
+    E: From<io::Error>,
+{
+    type Error = E;
+
+    fn poll_encode(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Result<EncodeBuffer, Self::Error>> {
+        let this = self.get_mut();
+        Poll::Ready(Ok(this
+            .buffer
+            .take()
+            .expect("ready encode polled after completion")))
     }
 }
 

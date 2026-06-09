@@ -1,14 +1,15 @@
 //! Experimental asynchronous DSA bytes codec for tonic.
 //!
-//! This crate exercises tonic's `Encoder::poll_encode` path with an explicit
+//! This crate exercises tonic's `AsyncEncode::poll_encode` path with an explicit
 //! in-flight Intel DSA copy. The encoder keeps ordinary CPU encoding as the
-//! default when no work queue is configured. When DSA is enabled, it submits a
-//! memmove descriptor, returns `Poll::Pending`, and finishes the gRPC frame after
-//! the descriptor completion record reaches a terminal status.
+//! default when no work queue is configured. When DSA is enabled, encoding
+//! returns an owned operation that submits a memmove descriptor, yields
+//! `Poll::Pending`, and finishes the gRPC frame after the descriptor completion
+//! record reaches a terminal status.
 //!
-//! The implementation transfers owned encode storage into the encoder before
-//! polling. Pending DSA work keeps that storage and its direct-DMA pointer inside
-//! encoder-owned state until completion.
+//! The implementation transfers owned encode storage into per-message encode
+//! state before polling. Pending DSA work keeps that storage and its direct-DMA
+//! pointer inside the encode operation until completion.
 
 #![warn(
     missing_debug_implementations,
@@ -32,7 +33,9 @@ use std::{
     task::{Context, Poll},
 };
 use tonic::Status;
-use tonic::codec::{BufferSettings, Codec, DecodeBuf, Decoder, EncodeBuffer, Encoder};
+use tonic::codec::{
+    AsyncEncode, BufferSettings, Codec, DecodeBuf, Decoder, EncodeBuffer, Encoder, ReadyEncode,
+};
 
 const DEFAULT_DSA_MIN_MESSAGE_BYTES: usize = 1;
 const PAGE_SIZE: usize = 4096;
@@ -293,16 +296,50 @@ impl Codec for DsaAsyncBytesCodec {
 pub struct DsaAsyncBytesEncoder {
     buffer_settings: BufferSettings,
     work_queue: Option<SharedDsaWorkQueue>,
-    state: EncodeState,
     #[cfg(test)]
     yielding_cpu_for_tests: bool,
 }
 
+/// Owned state for one bytes encode operation.
 #[derive(Debug)]
-enum EncodeState {
-    Idle,
-    Ready(EncodeBuffer),
+pub struct DsaAsyncBytesEncode {
+    state: DsaAsyncBytesEncodeState,
+}
+
+#[derive(Debug)]
+enum DsaAsyncBytesEncodeState {
+    Ready(ReadyEncode<Status>),
     Pending(PendingCopy),
+}
+
+impl DsaAsyncBytesEncode {
+    fn ready(buf: EncodeBuffer) -> Self {
+        Self {
+            state: DsaAsyncBytesEncodeState::Ready(ReadyEncode::new(buf)),
+        }
+    }
+
+    fn pending(copy: PendingCopy) -> Self {
+        Self {
+            state: DsaAsyncBytesEncodeState::Pending(copy),
+        }
+    }
+}
+
+impl AsyncEncode for DsaAsyncBytesEncode {
+    type Error = Status;
+
+    #[inline]
+    fn poll_encode(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<EncodeBuffer, Self::Error>> {
+        let this = self.get_mut();
+        match &mut this.state {
+            DsaAsyncBytesEncodeState::Ready(ready) => Pin::new(ready).poll_encode(cx),
+            DsaAsyncBytesEncodeState::Pending(pending) => pending.poll(cx),
+        }
+    }
 }
 
 impl fmt::Debug for DsaAsyncBytesEncoder {
@@ -310,7 +347,6 @@ impl fmt::Debug for DsaAsyncBytesEncoder {
         f.debug_struct("DsaAsyncBytesEncoder")
             .field("buffer_settings", &self.buffer_settings)
             .field("work_queue", &self.work_queue)
-            .field("state", &self.state)
             .finish()
     }
 }
@@ -347,7 +383,6 @@ impl DsaAsyncBytesEncoder {
         Self {
             buffer_settings,
             work_queue,
-            state: EncodeState::Idle,
             #[cfg(test)]
             yielding_cpu_for_tests: false,
         }
@@ -364,32 +399,27 @@ impl DsaAsyncBytesEncoder {
 impl Encoder for DsaAsyncBytesEncoder {
     type Item = Bytes;
     type Error = Status;
+    type Encode = DsaAsyncBytesEncode;
 
     #[inline]
-    fn start_encode(
+    fn encode(
         self: Pin<&mut Self>,
         item: Self::Item,
         mut dst: EncodeBuffer,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<Self::Encode, Self::Error> {
         let this = self.get_mut();
-        if !matches!(this.state, EncodeState::Idle) {
-            return Err(Status::internal(
-                "async dsa bytes encoder already has an in-flight encode",
-            ));
-        }
-
         let payload_len = item.len();
 
         #[cfg(test)]
         if this.yielding_cpu_for_tests {
-            this.state = EncodeState::Pending(PendingCopy::yielding_cpu(item, dst));
-            return Ok(());
+            return Ok(DsaAsyncBytesEncode::pending(PendingCopy::yielding_cpu(
+                item, dst,
+            )));
         }
 
         if !this.should_accelerate(payload_len) {
             dst.as_encode_buf().put(item);
-            this.state = EncodeState::Ready(dst);
-            return Ok(());
+            return Ok(DsaAsyncBytesEncode::ready(dst));
         }
 
         if payload_len > u32::MAX as usize {
@@ -404,33 +434,9 @@ impl Encoder for DsaAsyncBytesEncoder {
             .as_ref()
             .expect("DSA work queue checked before encoding")
             .clone();
-        this.state = EncodeState::Pending(PendingCopy::dsa(work_queue, item, dst));
-        Ok(())
-    }
-
-    #[inline]
-    fn poll_encode(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<EncodeBuffer, Self::Error>> {
-        let this = self.get_mut();
-        match &mut this.state {
-            EncodeState::Idle => panic!("poll_encode without pending item"),
-            EncodeState::Ready(_) => {
-                let EncodeState::Ready(buf) = std::mem::replace(&mut this.state, EncodeState::Idle)
-                else {
-                    unreachable!("ready state checked above");
-                };
-                Poll::Ready(Ok(buf))
-            }
-            EncodeState::Pending(pending) => match pending.poll(cx) {
-                Poll::Pending => Poll::Pending,
-                Poll::Ready(result) => {
-                    this.state = EncodeState::Idle;
-                    Poll::Ready(result)
-                }
-            },
-        }
+        Ok(DsaAsyncBytesEncode::pending(PendingCopy::dsa(
+            work_queue, item, dst,
+        )))
     }
 
     #[inline]
@@ -971,7 +977,6 @@ mod tests {
             Self {
                 buffer_settings,
                 work_queue: None,
-                state: EncodeState::Idle,
                 yielding_cpu_for_tests: true,
             }
         }

@@ -30,7 +30,7 @@ use std::{
 };
 use tonic::{
     Status,
-    codec::{Codec, DecodeBuf, Decoder, EncodeBuf, Encoder},
+    codec::{Codec, DecodeBuf, Decoder, EncodeBuffer, Encoder, ReadyEncode},
 };
 
 pub use protobuf;
@@ -85,22 +85,17 @@ impl<T> ProtoEncoder<T> {
 impl<T: Message> Encoder for ProtoEncoder<T> {
     type Item = T;
     type Error = Status;
+    type Encode = ReadyEncode<Status>;
 
-    const ENCODE_READY: bool = true;
-
-    fn encode_ready(
+    fn encode(
         self: Pin<&mut Self>,
         item: Self::Item,
-        mut buf: EncodeBuf<'_>,
-    ) -> Result<(), Self::Error> {
+        mut buf: EncodeBuffer,
+    ) -> Result<Self::Encode, Self::Error> {
         let _ = self;
-        // The protobuf library doesn't support serializing into a user-provided
-        // buffer. Instead, it allocates its own buffer, resulting in an extra
-        // copy and allocation.
-        // TODO: #2345 - Find a way to avoid this extra copy.
-        item.serialize()
-            .map_err(from_decode_error)
-            .map(|serialized| buf.put_slice(serialized.as_slice()))
+        let serialized = item.serialize().map_err(from_decode_error)?;
+        buf.as_encode_buf().put_slice(serialized.as_slice());
+        Ok(ReadyEncode::new(buf))
     }
 }
 

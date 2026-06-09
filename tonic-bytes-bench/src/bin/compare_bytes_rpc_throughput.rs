@@ -18,7 +18,7 @@ use tonic::{
     Request, Response, Status,
     body::Body,
     client::Grpc,
-    codec::{BufferSettings, Codec, DecodeBuf, Decoder, EncodeBuf, Encoder},
+    codec::{BufferSettings, Codec, DecodeBuf, Decoder, EncodeBuffer, Encoder, ReadyEncode},
     server::{NamedService, UnaryService},
     transport::{Channel, Endpoint, Server, server::TcpIncoming},
 };
@@ -172,18 +172,17 @@ impl Codec for StandardBytesCodec {
 impl Encoder for StandardBytesEncoder {
     type Item = BoxBuf;
     type Error = Status;
-
-    const ENCODE_READY: bool = true;
+    type Encode = ReadyEncode<Status>;
 
     #[inline]
-    fn encode_ready(
+    fn encode(
         self: Pin<&mut Self>,
         mut item: Self::Item,
-        mut dst: EncodeBuf<'_>,
-    ) -> Result<(), Status> {
+        mut dst: EncodeBuffer,
+    ) -> Result<Self::Encode, Status> {
         let _ = self;
-        dst.put(&mut *item);
-        Ok(())
+        dst.as_encode_buf().put(&mut *item);
+        Ok(ReadyEncode::new(dst))
     }
 
     #[inline]

@@ -7,7 +7,10 @@ use std::{
     pin::{Pin, pin},
     task::{Context, Poll},
 };
-use tonic::{Status, codec::BufferSettings, codec::EncodeBody, codec::EncodeBuf, codec::Encoder};
+use tonic::{
+    Status,
+    codec::{BufferSettings, EncodeBody, EncodeBuffer, Encoder, ReadyEncode},
+};
 use tonic_dsa_bytes_sync::{DsaConfig, DsaSyncBufEncoder, DsaWorkQueue};
 
 const DSA_WQ_ENV: &str = "TONIC_DSA_WQ";
@@ -20,18 +23,17 @@ struct SoftwareBufEncoder;
 impl Encoder for SoftwareBufEncoder {
     type Item = BoxBuf;
     type Error = Status;
-
-    const ENCODE_READY: bool = true;
+    type Encode = ReadyEncode<Status>;
 
     #[inline]
-    fn encode_ready(
+    fn encode(
         self: Pin<&mut Self>,
         mut item: Self::Item,
-        mut dst: EncodeBuf<'_>,
-    ) -> Result<(), Self::Error> {
+        mut dst: EncodeBuffer,
+    ) -> Result<Self::Encode, Self::Error> {
         let _ = self;
-        dst.put(&mut *item);
-        Ok(())
+        dst.as_encode_buf().put(&mut *item);
+        Ok(ReadyEncode::new(dst))
     }
 }
 

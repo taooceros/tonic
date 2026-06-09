@@ -5,7 +5,7 @@ use std::{
     task::{Context, Poll},
 };
 use tonic::Status;
-use tonic::codec::{BufferSettings, Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
+use tonic::codec::{BufferSettings, Codec, DecodeBuf, Decoder, EncodeBuffer, Encoder, ReadyEncode};
 
 /// A [`Codec`] that implements `application/grpc+proto` via the prost library.
 #[derive(Debug, Clone)]
@@ -98,19 +98,22 @@ impl<T: Message> Encoder for ProstEncoder<T> {
     type Item = T;
     type Error = Status;
 
-    const ENCODE_READY: bool = true;
+    type Encode = ReadyEncode<Status>;
 
     #[inline]
-    fn encode_ready(
+    fn encode(
         self: Pin<&mut Self>,
         item: Self::Item,
-        mut buf: EncodeBuf<'_>,
-    ) -> Result<(), Self::Error> {
+        mut buf: EncodeBuffer,
+    ) -> Result<Self::Encode, Self::Error> {
         let _ = self;
-        item.encode(&mut buf)
-            .expect("Message only errors if not enough space");
+        {
+            let mut dst = buf.as_encode_buf();
+            item.encode(&mut dst)
+                .expect("Message only errors if not enough space");
+        }
 
-        Ok(())
+        Ok(ReadyEncode::new(buf))
     }
 
     #[inline]
@@ -175,7 +178,7 @@ mod tests {
         task::{Context, Poll},
     };
     use tonic::codec::SingleMessageCompressionOverride;
-    use tonic::codec::{EncodeBody, EncodeBuffer, HEADER_SIZE, Streaming};
+    use tonic::codec::{AsyncEncode, EncodeBody, EncodeBuffer, HEADER_SIZE, Streaming};
 
     const LEN: usize = 10000;
     // The maximum uncompressed size in bytes for a message. Set to 2MB.
@@ -477,17 +480,16 @@ mod tests {
     impl Encoder for MockEncoder {
         type Item = Vec<u8>;
         type Error = Status;
+        type Encode = ReadyEncode<Status>;
 
-        const ENCODE_READY: bool = true;
-
-        fn encode_ready(
+        fn encode(
             self: Pin<&mut Self>,
             item: Self::Item,
-            mut buf: EncodeBuf<'_>,
-        ) -> Result<(), Self::Error> {
+            mut buf: EncodeBuffer,
+        ) -> Result<Self::Encode, Self::Error> {
             let _ = self;
-            buf.put(&item[..]);
-            Ok(())
+            buf.as_encode_buf().put(&item[..]);
+            Ok(ReadyEncode::new(buf))
         }
 
         fn buffer_settings(&self) -> BufferSettings {
@@ -495,59 +497,54 @@ mod tests {
         }
     }
 
-    #[derive(Debug, Default)]
-    struct PendingEncoder {
-        state: PendingEncoderState,
-    }
+    #[derive(Debug, Clone, Default)]
+    struct PendingEncoder;
 
-    #[derive(Debug, Default)]
-    enum PendingEncoderState {
-        #[default]
-        Idle,
-        Pending {
-            item: Vec<u8>,
-            buf: EncodeBuffer,
-            yielded: bool,
-        },
+    #[derive(Debug)]
+    struct PendingEncode {
+        item: Vec<u8>,
+        buf: Option<EncodeBuffer>,
+        yielded: bool,
     }
 
     impl Encoder for PendingEncoder {
         type Item = Vec<u8>;
         type Error = Status;
+        type Encode = PendingEncode;
 
-        fn start_encode(
+        fn encode(
             self: Pin<&mut Self>,
             item: Self::Item,
             buf: EncodeBuffer,
-        ) -> Result<(), Self::Error> {
-            self.get_mut().state = PendingEncoderState::Pending {
+        ) -> Result<Self::Encode, Self::Error> {
+            let _ = self;
+            Ok(PendingEncode {
                 item,
-                buf,
+                buf: Some(buf),
                 yielded: false,
-            };
-            Ok(())
+            })
         }
+    }
+
+    impl AsyncEncode for PendingEncode {
+        type Error = Status;
 
         fn poll_encode(
             self: Pin<&mut Self>,
             cx: &mut Context<'_>,
         ) -> Poll<Result<EncodeBuffer, Self::Error>> {
             let this = self.get_mut();
-            let PendingEncoderState::Pending { yielded, .. } = &mut this.state else {
-                panic!("poll_encode without pending item");
-            };
-            if !*yielded {
-                *yielded = true;
+            if !this.yielded {
+                this.yielded = true;
                 cx.waker().wake_by_ref();
                 return Poll::Pending;
             }
 
-            let PendingEncoderState::Pending { item, mut buf, .. } =
-                std::mem::take(&mut this.state)
-            else {
-                unreachable!("pending state checked above");
-            };
-            buf.as_encode_buf().put(&item[..]);
+            let mut buf = this
+                .buf
+                .take()
+                .expect("pending encode polled after completion");
+            buf.as_encode_buf().put(&this.item[..]);
             Poll::Ready(Ok(buf))
         }
     }

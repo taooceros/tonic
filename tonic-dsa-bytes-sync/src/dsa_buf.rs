@@ -15,7 +15,9 @@ use std::path::Path;
 use std::task::{Context, Poll};
 use std::{fmt, pin::Pin};
 use tonic::Status;
-use tonic::codec::{BufferSettings, Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
+use tonic::codec::{
+    BufferSettings, Codec, DecodeBuf, Decoder, EncodeBuf, EncodeBuffer, Encoder, ReadyEncode,
+};
 
 /// A tonic codec that sends raw [`Buf`] payloads and receives raw [`Bytes`].
 ///
@@ -201,16 +203,16 @@ impl DsaSyncBufEncoder {
 impl Encoder for DsaSyncBufEncoder {
     type Item = Box<dyn Buf + Send + Sync>;
     type Error = Status;
-
-    const ENCODE_READY: bool = true;
+    type Encode = ReadyEncode<Status>;
 
     #[inline]
-    fn encode_ready(
+    fn encode(
         self: Pin<&mut Self>,
         item: Self::Item,
-        dst: EncodeBuf<'_>,
-    ) -> Result<(), Self::Error> {
-        self.get_mut().encode_item(item, dst)
+        mut dst: EncodeBuffer,
+    ) -> Result<Self::Encode, Self::Error> {
+        self.get_mut().encode_item(item, dst.as_encode_buf())?;
+        Ok(ReadyEncode::new(dst))
     }
 
     #[inline]
