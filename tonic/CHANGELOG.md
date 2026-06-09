@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- *(codec)* mirror async encode with owned async decode operations.
+
 ## [0.14.6](https://github.com/hyperium/tonic/compare/tonic-v0.14.5...tonic-v0.14.6) - 2026-05-06
 
 ### Added

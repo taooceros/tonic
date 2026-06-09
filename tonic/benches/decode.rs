@@ -5,6 +5,7 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use http_body::{Body, Frame, SizeHint};
 use std::{
     fmt::{Error, Formatter},
+    future::{Ready, ready},
     pin::Pin,
     task::{Context, Poll},
 };
@@ -102,15 +103,13 @@ impl MockDecoder {
 impl Decoder for MockDecoder {
     type Item = Vec<u8>;
     type Error = Status;
+    type Decode = Ready<Result<Option<Vec<u8>>, Status>>;
 
-    fn poll_decode(
-        &mut self,
-        _cx: &mut Context<'_>,
-        mut buf: DecodeBuf<'_>,
-    ) -> Poll<Result<Option<Self::Item>, Self::Error>> {
+    fn decode(self: Pin<&mut Self>, mut buf: DecodeBuf<'_>) -> Result<Self::Decode, Self::Error> {
+        let this = self.get_mut();
         let out = Vec::from(buf.chunk());
-        buf.advance(self.message_size);
-        Poll::Ready(Ok(Some(out)))
+        buf.advance(this.message_size);
+        Ok(ready(Ok(Some(out))))
     }
 }
 

@@ -8,6 +8,7 @@ mod decode;
 mod encode;
 use crate::Status;
 use std::{
+    future::Future,
     io,
     marker::PhantomData,
     pin::Pin,
@@ -204,7 +205,7 @@ where
     }
 }
 
-/// Decodes gRPC message types
+/// Decodes gRPC message types.
 pub trait Decoder {
     /// The type that is decoded.
     type Item;
@@ -212,16 +213,16 @@ pub trait Decoder {
     /// The type of unrecoverable frame decoding errors.
     type Error: From<io::Error>;
 
-    /// Polls decoding of one full message from the provided buffer.
+    /// The owned future that completes one message decode.
+    type Decode: Future<Output = Result<Option<Self::Item>, Self::Error>> + Send + 'static;
+
+    /// Starts decoding one full message from the provided buffer.
     ///
-    /// The buffer contains exactly the bytes of a full message. Implementations
-    /// must not retain or advance the buffer after returning [`Poll::Pending`];
-    /// tonic will pass a fresh view of the same message bytes on the next poll.
-    fn poll_decode(
-        &mut self,
-        cx: &mut Context<'_>,
-        src: DecodeBuf<'_>,
-    ) -> Poll<Result<Option<Self::Item>, Self::Error>>;
+    /// The buffer contains exactly the bytes of a full message. Decoders that
+    /// complete immediately can return any ready future. Asynchronous decoders
+    /// should copy or otherwise move the message bytes into an owned operation
+    /// before returning.
+    fn decode(self: Pin<&mut Self>, src: DecodeBuf<'_>) -> Result<Self::Decode, Self::Error>;
 
     /// Controls how tonic creates and expands decode buffers.
     fn buffer_settings(&self) -> BufferSettings {

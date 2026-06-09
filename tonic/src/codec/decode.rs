@@ -75,7 +75,10 @@ where
 {
     #[pin]
     body: SyncWrapper<Body>,
+    #[pin]
     decoder: D,
+    #[pin]
+    in_flight: Option<D::Decode>,
     buffer_settings: BufferSettings,
     state: State,
     is_end_stream: bool,
@@ -231,6 +234,7 @@ where
     StreamingInner {
         body: SyncWrapper::new(body),
         decoder,
+        in_flight: None,
         buffer_settings,
         state: State::ReadHeader,
         is_end_stream: false,
@@ -253,8 +257,15 @@ where
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Option<T>, Status>> {
-        let result = {
-            let this = self.as_mut().project();
+        if self
+            .as_ref()
+            .project_ref()
+            .in_flight
+            .as_ref()
+            .get_ref()
+            .is_none()
+        {
+            let mut this = self.as_mut().project();
 
             if let State::ReadHeader = *this.state {
                 if this.buf.remaining() < HEADER_SIZE {
@@ -364,18 +375,31 @@ where
                 State::ReadHeader | State::ReadBody { .. } => return Poll::Ready(Ok(None)),
             };
 
-            if decompressed {
+            let decode = if decompressed {
                 let decode_buf = DecodeBuf::new(this.decompress_buf, len);
-                ready!(this.decoder.poll_decode(cx, decode_buf))
+                this.decoder.as_mut().decode(decode_buf)?
             } else {
                 let decode_buf = DecodeBuf::new(this.buf, len);
-                ready!(this.decoder.poll_decode(cx, decode_buf))
-            }
+                this.decoder.as_mut().decode(decode_buf)?
+            };
+            this.in_flight.set(Some(decode));
+        }
+
+        let result = {
+            let this = self.as_mut().project();
+            let decode = this
+                .in_flight
+                .as_pin_mut()
+                .expect("decode operation must be in-flight");
+            ready!(future::Future::poll(decode, cx))
         };
 
+        let mut this = self.as_mut().project();
+        this.in_flight.set(None);
         if let Ok(Some(_)) = &result {
-            *self.as_mut().project().state = State::ReadHeader;
+            *this.state = State::ReadHeader;
         }
+
         Poll::Ready(result)
     }
 

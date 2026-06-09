@@ -12,8 +12,11 @@ use super::{
 use bytes::{Buf, BufMut, Bytes};
 use idxd_rust::{DsaCompletionRecord, DsaCompletionStatus, DsaHwDesc};
 use std::path::Path;
-use std::task::{Context, Poll};
-use std::{fmt, pin::Pin};
+use std::{
+    fmt,
+    future::{Ready, ready},
+    pin::Pin,
+};
 use tonic::Status;
 use tonic::codec::{
     BufferSettings, Codec, DecodeBuf, Decoder, EncodeBuf, EncodeBuffer, Encoder, ReadyEncode,
@@ -243,14 +246,12 @@ impl Default for DsaSyncBytesDecoder {
 impl Decoder for DsaSyncBytesDecoder {
     type Item = Bytes;
     type Error = Status;
+    type Decode = Ready<Result<Option<Bytes>, Status>>;
 
     #[inline]
-    fn poll_decode(
-        &mut self,
-        _cx: &mut Context<'_>,
-        mut src: DecodeBuf<'_>,
-    ) -> Poll<Result<Option<Self::Item>, Self::Error>> {
-        Poll::Ready(Ok(Some(src.copy_to_bytes(src.remaining()))))
+    fn decode(self: Pin<&mut Self>, mut src: DecodeBuf<'_>) -> Result<Self::Decode, Self::Error> {
+        let _ = self;
+        Ok(ready(Ok(Some(src.copy_to_bytes(src.remaining())))))
     }
 
     #[inline]
@@ -535,6 +536,7 @@ mod tests {
     use http_body::Body;
     use std::path::Path;
     use std::pin::pin;
+    use std::task::{Context, Poll};
     use tonic::codec::{EncodeBody, HEADER_SIZE};
 
     #[test]

@@ -5,9 +5,9 @@
 use bytes::{Buf, BufMut};
 use serde::{Deserialize, Serialize};
 use std::{
+    future::{Ready, ready},
     marker::PhantomData,
     pin::Pin,
-    task::{Context, Poll},
 };
 use tonic::{
     Status,
@@ -47,23 +47,20 @@ impl<T: serde::Serialize> Encoder for JsonEncoder<T> {
 #[derive(Debug)]
 pub struct JsonDecoder<U>(PhantomData<U>);
 
-impl<U: serde::de::DeserializeOwned + Send> Decoder for JsonDecoder<U> {
+impl<U: serde::de::DeserializeOwned + Send + 'static> Decoder for JsonDecoder<U> {
     type Item = U;
     type Error = Status;
+    type Decode = Ready<Result<Option<U>, Status>>;
 
-    fn poll_decode(
-        &mut self,
-        _cx: &mut Context<'_>,
-        buf: DecodeBuf<'_>,
-    ) -> Poll<Result<Option<Self::Item>, Self::Error>> {
+    fn decode(self: Pin<&mut Self>, buf: DecodeBuf<'_>) -> Result<Self::Decode, Self::Error> {
+        let _ = self;
         if !buf.has_remaining() {
-            return Poll::Ready(Ok(None));
+            return Ok(ready(Ok(None)));
         }
 
-        let item = serde_json::from_reader(buf.reader())
-            .map(Some)
-            .map_err(|e| Status::internal(e.to_string()));
-        Poll::Ready(item)
+        let item =
+            serde_json::from_reader(buf.reader()).map_err(|e| Status::internal(e.to_string()))?;
+        Ok(ready(Ok(Some(item))))
     }
 }
 

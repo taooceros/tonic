@@ -24,9 +24,9 @@
 
 use bytes::{Buf, BufMut};
 use std::{
+    future::{Ready, ready},
     marker::PhantomData,
     pin::Pin,
-    task::{Context, Poll},
 };
 use tonic::{
     Status,
@@ -112,19 +112,18 @@ impl<U> ProtoDecoder<U> {
     }
 }
 
-impl<U: Message + Default> Decoder for ProtoDecoder<U> {
+impl<U: Message + Default + Send + 'static> Decoder for ProtoDecoder<U> {
     type Item = U;
     type Error = Status;
+    type Decode = Ready<Result<Option<U>, Status>>;
 
-    fn poll_decode(
-        &mut self,
-        _cx: &mut Context<'_>,
-        mut buf: DecodeBuf<'_>,
-    ) -> Poll<Result<Option<Self::Item>, Self::Error>> {
+    fn decode(self: Pin<&mut Self>, mut buf: DecodeBuf<'_>) -> Result<Self::Decode, Self::Error> {
+        let _ = self;
         let slice = buf.chunk();
-        let item = U::parse(slice).map_err(from_decode_error);
+        let item = U::parse(slice).map_err(from_decode_error)?;
         buf.advance(slice.len());
-        Poll::Ready(item.map(Some))
+
+        Ok(ready(Ok(Some(item))))
     }
 }
 

@@ -23,7 +23,7 @@
  */
 
 use std::error::Error;
-use std::future::Future;
+use std::future::{Future, Ready, ready};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -602,12 +602,10 @@ pub struct BytesDecoder {}
 impl Decoder for BytesDecoder {
     type Item = Bytes;
     type Error = TonicStatus;
+    type Decode = Ready<Result<Option<Bytes>, TonicStatus>>;
 
-    fn poll_decode(
-        &mut self,
-        _cx: &mut Context<'_>,
-        mut src: DecodeBuf<'_>,
-    ) -> Poll<Result<Option<Self::Item>, Self::Error>> {
-        Poll::Ready(Ok(Some(src.copy_to_bytes(src.remaining()))))
+    fn decode(self: Pin<&mut Self>, mut src: DecodeBuf<'_>) -> Result<Self::Decode, Self::Error> {
+        let _ = self;
+        Ok(ready(Ok(Some(src.copy_to_bytes(src.remaining())))))
     }
 }

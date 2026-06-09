@@ -6,7 +6,7 @@ use std::{
     convert::Infallible,
     env,
     ffi::OsString,
-    future::Future,
+    future::{Future, Ready, ready},
     net::SocketAddr,
     pin::Pin,
     task::{Context, Poll},
@@ -161,14 +161,12 @@ impl Encoder for StandardBytesEncoder {
 impl Decoder for StandardBytesDecoder {
     type Item = Bytes;
     type Error = Status;
+    type Decode = Ready<Result<Option<Bytes>, Status>>;
 
     #[inline]
-    fn poll_decode(
-        &mut self,
-        _cx: &mut Context<'_>,
-        mut src: DecodeBuf<'_>,
-    ) -> Poll<Result<Option<Self::Item>, Status>> {
-        Poll::Ready(Ok(Some(src.copy_to_bytes(src.remaining()))))
+    fn decode(self: Pin<&mut Self>, mut src: DecodeBuf<'_>) -> Result<Self::Decode, Status> {
+        let _ = self;
+        Ok(ready(Ok(Some(src.copy_to_bytes(src.remaining())))))
     }
 
     #[inline]

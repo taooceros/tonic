@@ -1,8 +1,8 @@
 use prost::Message;
 use std::{
+    future::{Ready, ready},
     marker::PhantomData,
     pin::Pin,
-    task::{Context, Poll},
 };
 use tonic::Status;
 use tonic::codec::{BufferSettings, Codec, DecodeBuf, Decoder, EncodeBuffer, Encoder, ReadyEncode};
@@ -139,20 +139,16 @@ impl<U> ProstDecoder<U> {
     }
 }
 
-impl<U: Message + Default> Decoder for ProstDecoder<U> {
+impl<U: Message + Default + Send + 'static> Decoder for ProstDecoder<U> {
     type Item = U;
     type Error = Status;
+    type Decode = Ready<Result<Option<U>, Status>>;
 
-    fn poll_decode(
-        &mut self,
-        _cx: &mut Context<'_>,
-        buf: DecodeBuf<'_>,
-    ) -> Poll<Result<Option<Self::Item>, Self::Error>> {
-        let item = Message::decode(buf)
-            .map(Option::Some)
-            .map_err(from_decode_error);
+    fn decode(self: Pin<&mut Self>, buf: DecodeBuf<'_>) -> Result<Self::Decode, Self::Error> {
+        let _ = self;
+        let item = Message::decode(buf).map_err(from_decode_error)?;
 
-        Poll::Ready(item)
+        Ok(ready(Ok(Some(item))))
     }
 
     fn buffer_settings(&self) -> BufferSettings {
@@ -555,15 +551,16 @@ mod tests {
     impl Decoder for MockDecoder {
         type Item = Vec<u8>;
         type Error = Status;
+        type Decode = Ready<Result<Option<Vec<u8>>, Status>>;
 
-        fn poll_decode(
-            &mut self,
-            _cx: &mut Context<'_>,
+        fn decode(
+            self: Pin<&mut Self>,
             mut buf: DecodeBuf<'_>,
-        ) -> Poll<Result<Option<Self::Item>, Self::Error>> {
+        ) -> Result<Self::Decode, Self::Error> {
+            let _ = self;
             let out = Vec::from(buf.chunk());
             buf.advance(LEN);
-            Poll::Ready(Ok(Some(out)))
+            Ok(ready(Ok(Some(out))))
         }
 
         fn buffer_settings(&self) -> BufferSettings {
@@ -572,29 +569,49 @@ mod tests {
     }
 
     #[derive(Debug, Clone, Default)]
-    struct PendingDecoder {
+    struct PendingDecoder;
+
+    #[derive(Debug)]
+    struct PendingDecode {
+        item: Option<Vec<u8>>,
         yielded: bool,
     }
 
     impl Decoder for PendingDecoder {
         type Item = Vec<u8>;
         type Error = Status;
+        type Decode = PendingDecode;
 
-        fn poll_decode(
-            &mut self,
-            cx: &mut Context<'_>,
+        fn decode(
+            self: Pin<&mut Self>,
             mut buf: DecodeBuf<'_>,
-        ) -> Poll<Result<Option<Self::Item>, Self::Error>> {
-            if !self.yielded {
-                self.yielded = true;
+        ) -> Result<Self::Decode, Self::Error> {
+            let _ = self;
+            let out = Vec::from(buf.chunk());
+            buf.advance(LEN);
+            Ok(PendingDecode {
+                item: Some(out),
+                yielded: false,
+            })
+        }
+    }
+
+    impl Future for PendingDecode {
+        type Output = Result<Option<Vec<u8>>, Status>;
+
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            let this = self.get_mut();
+            if !this.yielded {
+                this.yielded = true;
                 cx.waker().wake_by_ref();
                 return Poll::Pending;
             }
 
-            self.yielded = false;
-            let out = Vec::from(buf.chunk());
-            buf.advance(LEN);
-            Poll::Ready(Ok(Some(out)))
+            Poll::Ready(Ok(Some(
+                this.item
+                    .take()
+                    .expect("pending decode polled after completion"),
+            )))
         }
     }
 

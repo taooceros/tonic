@@ -26,6 +26,7 @@ use bytes::{Buf, BufMut, Bytes};
 use idxd_rust::{DsaCompletionRecord, DsaCompletionStatus, DsaHwDesc, WqPortal, detect_wq_mode};
 use std::{
     fmt,
+    future::{Ready, ready},
     marker::PhantomPinned,
     path::PathBuf,
     pin::Pin,
@@ -467,14 +468,12 @@ impl Default for DsaAsyncBytesDecoder {
 impl Decoder for DsaAsyncBytesDecoder {
     type Item = Bytes;
     type Error = Status;
+    type Decode = Ready<Result<Option<Bytes>, Status>>;
 
     #[inline]
-    fn poll_decode(
-        &mut self,
-        _cx: &mut Context<'_>,
-        mut src: DecodeBuf<'_>,
-    ) -> Poll<Result<Option<Self::Item>, Self::Error>> {
-        Poll::Ready(Ok(Some(src.copy_to_bytes(src.remaining()))))
+    fn decode(self: Pin<&mut Self>, mut src: DecodeBuf<'_>) -> Result<Self::Decode, Self::Error> {
+        let _ = self;
+        Ok(ready(Ok(Some(src.copy_to_bytes(src.remaining())))))
     }
 
     #[inline]

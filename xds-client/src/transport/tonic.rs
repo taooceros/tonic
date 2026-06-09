@@ -9,10 +9,14 @@ use crate::error::{Error, Result};
 use crate::transport::{Transport, TransportBuilder, TransportStream};
 use bytes::{Buf, BufMut, Bytes};
 use http::uri::PathAndQuery;
+use std::{
+    future::{Ready, ready},
+    pin::Pin,
+};
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt as _;
 use tonic::client::Grpc;
-use tonic::codec::{Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
+use tonic::codec::{Codec, DecodeBuf, Decoder, EncodeBuffer, Encoder, ReadyEncode};
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Status, Streaming};
 
@@ -50,14 +54,16 @@ struct BytesEncoder;
 impl Encoder for BytesEncoder {
     type Item = Bytes;
     type Error = Status;
+    type Encode = ReadyEncode<Status>;
 
     fn encode(
-        &mut self,
+        self: Pin<&mut Self>,
         item: Self::Item,
-        dst: &mut EncodeBuf<'_>,
-    ) -> std::result::Result<(), Self::Error> {
-        dst.put_slice(&item);
-        Ok(())
+        mut dst: EncodeBuffer,
+    ) -> std::result::Result<Self::Encode, Self::Error> {
+        let _ = self;
+        dst.as_encode_buf().put_slice(&item);
+        Ok(ReadyEncode::new(dst))
     }
 }
 
@@ -67,12 +73,14 @@ struct BytesDecoder;
 impl Decoder for BytesDecoder {
     type Item = Bytes;
     type Error = Status;
+    type Decode = Ready<std::result::Result<Option<Bytes>, Status>>;
 
     fn decode(
-        &mut self,
-        src: &mut DecodeBuf<'_>,
-    ) -> std::result::Result<Option<Self::Item>, Self::Error> {
-        Ok(Some(src.copy_to_bytes(src.remaining())))
+        self: Pin<&mut Self>,
+        mut src: DecodeBuf<'_>,
+    ) -> std::result::Result<Self::Decode, Self::Error> {
+        let _ = self;
+        Ok(ready(Ok(Some(src.copy_to_bytes(src.remaining())))))
     }
 }
 
