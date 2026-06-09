@@ -1,6 +1,6 @@
 //! Experimental asynchronous DSA bytes codec for tonic.
 //!
-//! This crate exercises tonic's `AsyncEncode::poll_encode` path with an explicit
+//! This crate exercises tonic's owned encode `Future` path with an explicit
 //! in-flight Intel DSA copy. The encoder keeps ordinary CPU encoding as the
 //! default when no work queue is configured. When DSA is enabled, encoding
 //! returns an owned operation that submits a memmove descriptor, yields
@@ -26,7 +26,7 @@ use bytes::{Buf, BufMut, Bytes};
 use idxd_rust::{DsaCompletionRecord, DsaCompletionStatus, DsaHwDesc, WqPortal, detect_wq_mode};
 use std::{
     fmt,
-    future::{Ready, ready},
+    future::{Future, Ready, ready},
     marker::PhantomPinned,
     path::PathBuf,
     pin::Pin,
@@ -34,9 +34,7 @@ use std::{
     task::{Context, Poll},
 };
 use tonic::Status;
-use tonic::codec::{
-    AsyncEncode, BufferSettings, Codec, DecodeBuf, Decoder, EncodeBuffer, Encoder, ReadyEncode,
-};
+use tonic::codec::{BufferSettings, Codec, DecodeBuf, Decoder, EncodeBuffer, Encoder};
 
 const DEFAULT_DSA_MIN_MESSAGE_BYTES: usize = 1;
 const PAGE_SIZE: usize = 4096;
@@ -309,14 +307,14 @@ pub struct DsaAsyncBytesEncode {
 
 #[derive(Debug)]
 enum DsaAsyncBytesEncodeState {
-    Ready(ReadyEncode<Status>),
+    Ready(Ready<Result<EncodeBuffer, Status>>),
     Pending(PendingCopy),
 }
 
 impl DsaAsyncBytesEncode {
     fn ready(buf: EncodeBuffer) -> Self {
         Self {
-            state: DsaAsyncBytesEncodeState::Ready(ReadyEncode::new(buf)),
+            state: DsaAsyncBytesEncodeState::Ready(ready(Ok(buf))),
         }
     }
 
@@ -327,17 +325,14 @@ impl DsaAsyncBytesEncode {
     }
 }
 
-impl AsyncEncode for DsaAsyncBytesEncode {
-    type Error = Status;
+impl Future for DsaAsyncBytesEncode {
+    type Output = Result<EncodeBuffer, Status>;
 
     #[inline]
-    fn poll_encode(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<EncodeBuffer, Self::Error>> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
         match &mut this.state {
-            DsaAsyncBytesEncodeState::Ready(ready) => Pin::new(ready).poll_encode(cx),
+            DsaAsyncBytesEncodeState::Ready(ready) => Pin::new(ready).poll(cx),
             DsaAsyncBytesEncodeState::Pending(pending) => pending.poll(cx),
         }
     }

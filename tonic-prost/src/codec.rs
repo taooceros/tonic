@@ -5,7 +5,7 @@ use std::{
     pin::Pin,
 };
 use tonic::Status;
-use tonic::codec::{BufferSettings, Codec, DecodeBuf, Decoder, EncodeBuffer, Encoder, ReadyEncode};
+use tonic::codec::{BufferSettings, Codec, DecodeBuf, Decoder, EncodeBuffer, Encoder};
 
 /// A [`Codec`] that implements `application/grpc+proto` via the prost library.
 #[derive(Debug, Clone)]
@@ -98,7 +98,7 @@ impl<T: Message> Encoder for ProstEncoder<T> {
     type Item = T;
     type Error = Status;
 
-    type Encode = ReadyEncode<Status>;
+    type Encode = Ready<Result<EncodeBuffer, Status>>;
 
     #[inline]
     fn encode(
@@ -113,7 +113,7 @@ impl<T: Message> Encoder for ProstEncoder<T> {
                 .expect("Message only errors if not enough space");
         }
 
-        Ok(ReadyEncode::new(buf))
+        Ok(ready(Ok(buf)))
     }
 
     #[inline]
@@ -174,7 +174,7 @@ mod tests {
         task::{Context, Poll},
     };
     use tonic::codec::SingleMessageCompressionOverride;
-    use tonic::codec::{AsyncEncode, EncodeBody, EncodeBuffer, HEADER_SIZE, Streaming};
+    use tonic::codec::{EncodeBody, EncodeBuffer, HEADER_SIZE, Streaming};
 
     const LEN: usize = 10000;
     // The maximum uncompressed size in bytes for a message. Set to 2MB.
@@ -476,7 +476,7 @@ mod tests {
     impl Encoder for MockEncoder {
         type Item = Vec<u8>;
         type Error = Status;
-        type Encode = ReadyEncode<Status>;
+        type Encode = Ready<Result<EncodeBuffer, Status>>;
 
         fn encode(
             self: Pin<&mut Self>,
@@ -485,7 +485,7 @@ mod tests {
         ) -> Result<Self::Encode, Self::Error> {
             let _ = self;
             buf.as_encode_buf().put(&item[..]);
-            Ok(ReadyEncode::new(buf))
+            Ok(ready(Ok(buf)))
         }
 
         fn buffer_settings(&self) -> BufferSettings {
@@ -522,13 +522,10 @@ mod tests {
         }
     }
 
-    impl AsyncEncode for PendingEncode {
-        type Error = Status;
+    impl Future for PendingEncode {
+        type Output = Result<EncodeBuffer, Status>;
 
-        fn poll_encode(
-            self: Pin<&mut Self>,
-            cx: &mut Context<'_>,
-        ) -> Poll<Result<EncodeBuffer, Self::Error>> {
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
             let this = self.get_mut();
             if !this.yielded {
                 this.yielded = true;

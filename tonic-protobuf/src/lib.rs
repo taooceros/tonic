@@ -30,7 +30,7 @@ use std::{
 };
 use tonic::{
     Status,
-    codec::{Codec, DecodeBuf, Decoder, EncodeBuffer, Encoder, ReadyEncode},
+    codec::{Codec, DecodeBuf, Decoder, EncodeBuffer, Encoder},
 };
 
 pub use protobuf;
@@ -85,7 +85,7 @@ impl<T> ProtoEncoder<T> {
 impl<T: Message> Encoder for ProtoEncoder<T> {
     type Item = T;
     type Error = Status;
-    type Encode = ReadyEncode<Status>;
+    type Encode = Ready<Result<EncodeBuffer, Status>>;
 
     fn encode(
         self: Pin<&mut Self>,
@@ -95,7 +95,7 @@ impl<T: Message> Encoder for ProtoEncoder<T> {
         let _ = self;
         let serialized = item.serialize().map_err(from_decode_error)?;
         buf.as_encode_buf().put_slice(serialized.as_slice());
-        Ok(ReadyEncode::new(buf))
+        Ok(ready(Ok(buf)))
     }
 }
 

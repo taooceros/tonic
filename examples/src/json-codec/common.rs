@@ -11,7 +11,7 @@ use std::{
 };
 use tonic::{
     Status,
-    codec::{Codec, DecodeBuf, Decoder, EncodeBuffer, Encoder, ReadyEncode},
+    codec::{Codec, DecodeBuf, Decoder, EncodeBuffer, Encoder},
 };
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -30,7 +30,7 @@ pub struct JsonEncoder<T>(PhantomData<T>);
 impl<T: serde::Serialize> Encoder for JsonEncoder<T> {
     type Item = T;
     type Error = Status;
-    type Encode = ReadyEncode<Status>;
+    type Encode = Ready<Result<EncodeBuffer, Status>>;
 
     fn encode(
         self: Pin<&mut Self>,
@@ -40,7 +40,7 @@ impl<T: serde::Serialize> Encoder for JsonEncoder<T> {
         let _ = self;
         serde_json::to_writer(buf.as_encode_buf().writer(), &item)
             .map_err(|e| Status::internal(e.to_string()))?;
-        Ok(ReadyEncode::new(buf))
+        Ok(ready(Ok(buf)))
     }
 }
 

@@ -1,15 +1,14 @@
 use super::compression::{
     CompressionEncoding, CompressionSettings, SingleMessageCompressionOverride, compress,
 };
-use super::{
-    AsyncEncode, BufferSettings, DEFAULT_MAX_SEND_MESSAGE_SIZE, EncodeBuffer, Encoder, HEADER_SIZE,
-};
+use super::{BufferSettings, DEFAULT_MAX_SEND_MESSAGE_SIZE, EncodeBuffer, Encoder, HEADER_SIZE};
 use crate::Status;
 use bytes::{BufMut, Bytes, BytesMut};
 use http::HeaderMap;
 use http_body::{Body, Frame};
 use pin_project::pin_project;
 use std::{
+    future::Future,
     pin::Pin,
     task::{Context, Poll, ready},
 };
@@ -126,7 +125,7 @@ where
                 .in_flight
                 .as_pin_mut()
                 .expect("encode operation must be in-flight");
-            ready!(encode.poll_encode(cx))
+            ready!(encode.poll(cx))
         };
 
         let mut this = self.as_mut().project();

@@ -16,7 +16,7 @@ use std::{
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt as _;
 use tonic::client::Grpc;
-use tonic::codec::{Codec, DecodeBuf, Decoder, EncodeBuffer, Encoder, ReadyEncode};
+use tonic::codec::{Codec, DecodeBuf, Decoder, EncodeBuffer, Encoder};
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Status, Streaming};
 
@@ -54,7 +54,7 @@ struct BytesEncoder;
 impl Encoder for BytesEncoder {
     type Item = Bytes;
     type Error = Status;
-    type Encode = ReadyEncode<Status>;
+    type Encode = Ready<std::result::Result<EncodeBuffer, Status>>;
 
     fn encode(
         self: Pin<&mut Self>,
@@ -63,7 +63,7 @@ impl Encoder for BytesEncoder {
     ) -> std::result::Result<Self::Encode, Self::Error> {
         let _ = self;
         dst.as_encode_buf().put_slice(&item);
-        Ok(ReadyEncode::new(dst))
+        Ok(ready(Ok(dst)))
     }
 }
 

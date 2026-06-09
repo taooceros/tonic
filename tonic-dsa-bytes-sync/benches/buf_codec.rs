@@ -4,12 +4,13 @@ use bencher::{Bencher, benchmark_group, benchmark_main, black_box};
 use bytes::{Buf, BufMut, Bytes};
 use http_body::Body;
 use std::{
+    future::{Ready, ready},
     pin::{Pin, pin},
     task::{Context, Poll},
 };
 use tonic::{
     Status,
-    codec::{BufferSettings, EncodeBody, EncodeBuffer, Encoder, ReadyEncode},
+    codec::{BufferSettings, EncodeBody, EncodeBuffer, Encoder},
 };
 use tonic_dsa_bytes_sync::{DsaConfig, DsaSyncBufEncoder, DsaWorkQueue};
 
@@ -23,7 +24,7 @@ struct SoftwareBufEncoder;
 impl Encoder for SoftwareBufEncoder {
     type Item = BoxBuf;
     type Error = Status;
-    type Encode = ReadyEncode<Status>;
+    type Encode = Ready<Result<EncodeBuffer, Status>>;
 
     #[inline]
     fn encode(
@@ -33,7 +34,7 @@ impl Encoder for SoftwareBufEncoder {
     ) -> Result<Self::Encode, Self::Error> {
         let _ = self;
         dst.as_encode_buf().put(&mut *item);
-        Ok(ReadyEncode::new(dst))
+        Ok(ready(Ok(dst)))
     }
 }
 

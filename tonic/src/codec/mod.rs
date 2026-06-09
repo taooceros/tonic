@@ -7,13 +7,7 @@ pub(crate) mod compression;
 mod decode;
 mod encode;
 use crate::Status;
-use std::{
-    future::Future,
-    io,
-    marker::PhantomData,
-    pin::Pin,
-    task::{Context, Poll},
-};
+use std::{future::Future, io, pin::Pin};
 
 pub use self::buffer::{DecodeBuf, EncodeBuf, EncodeBuffer};
 pub use self::compression::{CompressionEncoding, EnabledCompressionEncodings};
@@ -135,15 +129,15 @@ pub trait Encoder {
     /// The type of unrecoverable frame encoding errors.
     type Error: From<io::Error>;
 
-    /// The owned operation that completes one message encode.
-    type Encode: AsyncEncode<Error = Self::Error> + Send + 'static;
+    /// The owned future that completes one message encode.
+    type Encode: Future<Output = Result<EncodeBuffer, Self::Error>> + Send + 'static;
 
-    /// Encodes one message into owned encode storage.
+    /// Starts encoding one message into owned encode storage.
     ///
-    /// Synchronous encoders should write the payload immediately and return
-    /// [`ReadyEncode`]. Asynchronous encoders should return an owned operation
-    /// that keeps all item, buffer, and cancellation state until
-    /// [`AsyncEncode::poll_encode`] returns the completed buffer.
+    /// Synchronous encoders should write the payload immediately and return a
+    /// ready future. Asynchronous encoders should return an owned future that
+    /// keeps all item, buffer, and cancellation state until it returns the
+    /// completed buffer.
     fn encode(
         self: Pin<&mut Self>,
         item: Self::Item,
@@ -153,55 +147,6 @@ pub trait Encoder {
     /// Controls how tonic creates and expands encode buffers.
     fn buffer_settings(&self) -> BufferSettings {
         BufferSettings::default()
-    }
-}
-
-/// Owned state for one in-flight message encode.
-pub trait AsyncEncode {
-    /// The type of encoding errors.
-    type Error: From<io::Error>;
-
-    /// Polls this message encode to completion.
-    fn poll_encode(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<EncodeBuffer, Self::Error>>;
-}
-
-/// An immediately-complete encode operation for synchronous encoders.
-#[derive(Debug)]
-pub struct ReadyEncode<E> {
-    buffer: Option<EncodeBuffer>,
-    _marker: PhantomData<fn() -> E>,
-}
-
-impl<E> ReadyEncode<E> {
-    /// Creates a ready encode operation containing the completed buffer.
-    pub fn new(buffer: EncodeBuffer) -> Self {
-        Self {
-            buffer: Some(buffer),
-            _marker: PhantomData,
-        }
-    }
-}
-
-impl<E> Unpin for ReadyEncode<E> {}
-
-impl<E> AsyncEncode for ReadyEncode<E>
-where
-    E: From<io::Error>,
-{
-    type Error = E;
-
-    fn poll_encode(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-    ) -> Poll<Result<EncodeBuffer, Self::Error>> {
-        let this = self.get_mut();
-        Poll::Ready(Ok(this
-            .buffer
-            .take()
-            .expect("ready encode polled after completion")))
     }
 }
 

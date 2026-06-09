@@ -7,7 +7,8 @@ use http_body::Body as HttpBody;
 use http_body_util::BodyExt;
 use pin_project::pin_project;
 use std::{
-    fmt, future,
+    fmt,
+    future::{self, Future},
     marker::PhantomData,
     pin::Pin,
     task::{Context, Poll, ready},
@@ -391,7 +392,7 @@ where
                 .in_flight
                 .as_pin_mut()
                 .expect("decode operation must be in-flight");
-            ready!(future::Future::poll(decode, cx))
+            ready!(decode.poll(cx))
         };
 
         let mut this = self.as_mut().project();
