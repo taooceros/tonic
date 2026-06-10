@@ -1,31 +1,30 @@
 [package]
-name = "tonic-dsa-bytes-async"
-version = "0.1.0"
+name = "tonic-prost-async"
+version = "0.14.6"
 authors = ["Lucio Franco <luciofranco14@gmail.com>"]
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/hyperium/tonic"
 homepage = "https://github.com/hyperium/tonic"
-description = "Experimental asynchronous DSA bytes codec implementation for tonic"
+description = "Async prost codec implementation for tonic"
 categories = ["network-programming", "asynchronous"]
-keywords = ["rpc", "grpc", "bytes", "dsa", "tonic"]
+keywords = ["rpc", "grpc", "prost", "protobuf", "tonic"]
 rust-version = { workspace = true }
 
 [dependencies]
-bytes = "1"
-idxd-rust = { path = "../../../idxd-rust" }
-prost = { version = "0.14", path = "../prost/prost" }
 tonic = { version = "0.14.6", path = "../tonic", default-features = false }
+prost = "0.14"
+bytes = "1"
 
 [dev-dependencies]
-http-body = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tokio-stream = "0.1"
-
-[lints]
-workspace = true
+http-body = "1"
+http-body-util = "0.1"
 
 [package.metadata.cargo_check_external_types]
 allowed_external_types = [
   "tonic::*",
-  "bytes::*",
+  "prost::*",
+  "prost"
 ]

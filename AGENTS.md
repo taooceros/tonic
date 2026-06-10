@@ -13,6 +13,8 @@ tonic into a hardware-specific fork.
 - DSA paths must stay opt-in. Device paths, shared work queues, descriptor
   polling, and other `idxd` details belong behind the DSA crate boundary until a
   tonic-level abstraction is justified.
+- Do not run hardware-facing binaries directly when the documented flow requires
+  `launch` or `dsa_launcher`.
 - Preserve the ordinary `tonic-prost` codec as the baseline. When changing codec
   hot paths, compare against the recorded benchmark baseline before claiming a
   performance win or no regression.

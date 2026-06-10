@@ -35,6 +35,11 @@ use std::{
 };
 use tonic::Status;
 use tonic::codec::{BufferSettings, Codec, DecodeBuf, Decoder, EncodeBuffer, Encoder};
+mod prost_codec;
+
+pub use prost_codec::{
+    DsaAsyncProstCodec, DsaAsyncProstDecoder, DsaAsyncProstEncode, DsaAsyncProstEncoder,
+};
 
 const DEFAULT_DSA_MIN_MESSAGE_BYTES: usize = 1;
 const PAGE_SIZE: usize = 4096;

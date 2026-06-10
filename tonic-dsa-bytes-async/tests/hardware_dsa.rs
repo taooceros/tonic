@@ -14,9 +14,7 @@ use tonic::{
 };
 use tonic_dsa_bytes_async::{DsaAsyncBytesEncoder, DsaConfig, DsaWorkQueue};
 
-#[test]
-#[ignore = "requires an enabled /dev/dsa work queue and CAP_SYS_RAWIO"]
-fn dsa_work_queue_encodes_one_frame() {
+fn open_test_work_queue() -> tonic_dsa_bytes_async::SharedDsaWorkQueue {
     let device_path = env::var_os("TONIC_DSA_WQ")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/dev/dsa/wq0.0"));
@@ -26,9 +24,13 @@ fn dsa_work_queue_encodes_one_frame() {
         device_path.display()
     );
 
-    let work_queue =
-        DsaWorkQueue::open(DsaConfig::new(device_path.clone()).with_min_message_bytes(1))
-            .unwrap_or_else(|err| panic!("failed to open {}: {err}", device_path.display()));
+    DsaWorkQueue::open(DsaConfig::new(device_path.clone()).with_min_message_bytes(1))
+        .unwrap_or_else(|err| panic!("failed to open {}: {err}", device_path.display()))
+}
+
+#[test]
+fn dsa_work_queue_encodes_one_frame() {
+    let work_queue = open_test_work_queue();
 
     let payload = Bytes::from_static(b"async dsa hardware payload");
     let expected_payload = payload.clone();
@@ -60,12 +62,26 @@ fn poll_next_frame<B>(
 where
     B: Body<Data = Bytes, Error = Status>,
 {
+    poll_next_frame_with_pending_count(body, cx).0
+}
+
+fn poll_next_frame_with_pending_count<B>(
+    body: &mut std::pin::Pin<&mut B>,
+    cx: &mut Context<'_>,
+) -> (http_body::Frame<Bytes>, usize)
+where
+    B: Body<Data = Bytes, Error = Status>,
+{
+    let mut pending_polls = 0;
     for _ in 0..1_000_000 {
         match body.as_mut().poll_frame(cx) {
-            Poll::Ready(Some(Ok(frame))) => return frame,
+            Poll::Ready(Some(Ok(frame))) => return (frame, pending_polls),
             Poll::Ready(Some(Err(status))) => panic!("encode failed: {status}"),
             Poll::Ready(None) => panic!("body ended before data"),
-            Poll::Pending => core::hint::spin_loop(),
+            Poll::Pending => {
+                pending_polls += 1;
+                core::hint::spin_loop();
+            }
         }
     }
 

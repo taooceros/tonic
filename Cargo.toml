@@ -7,6 +7,7 @@ members = [
   "tonic-types",
   "tonic-reflection",
   "tonic-prost",
+  "tonic-prost-async",
   "tonic-dsa-bytes-sync",
   "tonic-dsa-bytes-async",
   "tonic-bytes-bench",
@@ -27,6 +28,7 @@ members = [
   "tests/wellknown-compiled",
   "tests/extern_path/uuid",
   "tests/extern_path/my_application",
+  "customized-integration-tests",
   "tests/integration_tests",
   "tests/compression",
   "tests/compile",
@@ -35,10 +37,14 @@ members = [
   "tests/deprecated_methods",
 ]
 resolver = "2"
+exclude = ["prost"]
 
 [patch.crates-io]
 tonic = { path = "tonic" }
 tonic-prost = { path = "tonic-prost" }
+prost = { path = "prost/prost" }
+prost-build = { path = "prost/prost-build" }
+prost-types = { path = "prost/prost-types" }
 
 [workspace.package]
 rust-version = "1.88"
