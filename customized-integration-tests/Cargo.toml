@@ -12,3 +12,13 @@ hardware-dsa = ["dep:idxd-rust"]
 idxd-rust = { path = "../../../idxd-rust", optional = true }
 prost = { path = "../prost/prost" }
 tonic = { path = "../tonic" }
+
+[build-dependencies]
+prost-build = { path = "../prost/prost-build" }
+
+[dev-dependencies]
+criterion = { version = "0.8", default-features = false }
+
+[[bench]]
+name = "async_payload_encode"
+harness = false
