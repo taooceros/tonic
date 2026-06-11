@@ -4,10 +4,14 @@
 
 use bytes::{Buf, BufMut};
 use serde::{Deserialize, Serialize};
-use std::marker::PhantomData;
+use std::{
+    future::{Ready, ready},
+    marker::PhantomData,
+    pin::Pin,
+};
 use tonic::{
     Status,
-    codec::{Codec, DecodeBuf, Decoder, EncodeBuf, Encoder},
+    codec::{Codec, DecodeBuf, Decoder, EncodeBuffer, Encoder},
 };
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -26,27 +30,37 @@ pub struct JsonEncoder<T>(PhantomData<T>);
 impl<T: serde::Serialize> Encoder for JsonEncoder<T> {
     type Item = T;
     type Error = Status;
+    type Encode = Ready<Result<EncodeBuffer, Status>>;
 
-    fn encode(&mut self, item: Self::Item, buf: &mut EncodeBuf<'_>) -> Result<(), Self::Error> {
-        serde_json::to_writer(buf.writer(), &item).map_err(|e| Status::internal(e.to_string()))
+    fn encode(
+        self: Pin<&mut Self>,
+        item: Self::Item,
+        mut buf: EncodeBuffer,
+    ) -> Result<Self::Encode, Self::Error> {
+        let _ = self;
+        serde_json::to_writer(buf.as_encode_buf().writer(), &item)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(ready(Ok(buf)))
     }
 }
 
 #[derive(Debug)]
 pub struct JsonDecoder<U>(PhantomData<U>);
 
-impl<U: serde::de::DeserializeOwned> Decoder for JsonDecoder<U> {
+impl<U: serde::de::DeserializeOwned + Send + 'static> Decoder for JsonDecoder<U> {
     type Item = U;
     type Error = Status;
+    type Decode = Ready<Result<Option<U>, Status>>;
 
-    fn decode(&mut self, buf: &mut DecodeBuf<'_>) -> Result<Option<Self::Item>, Self::Error> {
+    fn decode(self: Pin<&mut Self>, buf: DecodeBuf<'_>) -> Result<Self::Decode, Self::Error> {
+        let _ = self;
         if !buf.has_remaining() {
-            return Ok(None);
+            return Ok(ready(Ok(None)));
         }
 
-        let item: Self::Item =
+        let item =
             serde_json::from_reader(buf.reader()).map_err(|e| Status::internal(e.to_string()))?;
-        Ok(Some(item))
+        Ok(ready(Ok(Some(item))))
     }
 }
 

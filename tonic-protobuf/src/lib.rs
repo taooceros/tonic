@@ -23,10 +23,14 @@
  */
 
 use bytes::{Buf, BufMut};
-use std::marker::PhantomData;
+use std::{
+    future::{Ready, ready},
+    marker::PhantomData,
+    pin::Pin,
+};
 use tonic::{
     Status,
-    codec::{Codec, DecodeBuf, Decoder, EncodeBuf, Encoder},
+    codec::{Codec, DecodeBuf, Decoder, EncodeBuffer, Encoder},
 };
 
 pub use protobuf;
@@ -81,15 +85,17 @@ impl<T> ProtoEncoder<T> {
 impl<T: Message> Encoder for ProtoEncoder<T> {
     type Item = T;
     type Error = Status;
+    type Encode = Ready<Result<EncodeBuffer, Status>>;
 
-    fn encode(&mut self, item: Self::Item, buf: &mut EncodeBuf<'_>) -> Result<(), Self::Error> {
-        // The protobuf library doesn't support serializing into a user-provided
-        // buffer. Instead, it allocates its own buffer, resulting in an extra
-        // copy and allocation.
-        // TODO: #2345 - Find a way to avoid this extra copy.
+    fn encode(
+        self: Pin<&mut Self>,
+        item: Self::Item,
+        mut buf: EncodeBuffer,
+    ) -> Result<Self::Encode, Self::Error> {
+        let _ = self;
         let serialized = item.serialize().map_err(from_decode_error)?;
-        buf.put_slice(serialized.as_slice());
-        Ok(())
+        buf.as_encode_buf().put_slice(serialized.as_slice());
+        Ok(ready(Ok(buf)))
     }
 }
 
@@ -106,15 +112,18 @@ impl<U> ProtoDecoder<U> {
     }
 }
 
-impl<U: Message + Default> Decoder for ProtoDecoder<U> {
+impl<U: Message + Default + Send + 'static> Decoder for ProtoDecoder<U> {
     type Item = U;
     type Error = Status;
+    type Decode = Ready<Result<Option<U>, Status>>;
 
-    fn decode(&mut self, buf: &mut DecodeBuf<'_>) -> Result<Option<Self::Item>, Self::Error> {
+    fn decode(self: Pin<&mut Self>, mut buf: DecodeBuf<'_>) -> Result<Self::Decode, Self::Error> {
+        let _ = self;
         let slice = buf.chunk();
         let item = U::parse(slice).map_err(from_decode_error)?;
         buf.advance(slice.len());
-        Ok(Some(item))
+
+        Ok(ready(Ok(Some(item))))
     }
 }
 

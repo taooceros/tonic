@@ -23,7 +23,7 @@
  */
 
 use std::error::Error;
-use std::future::Future;
+use std::future::{Future, Ready, ready};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -56,8 +56,9 @@ use tonic::body::Body;
 use tonic::client::Grpc;
 use tonic::client::GrpcService;
 use tonic::codec::Codec;
+use tonic::codec::DecodeBuf;
 use tonic::codec::Decoder;
-use tonic::codec::EncodeBuf;
+use tonic::codec::EncodeBuffer;
 use tonic::codec::Encoder;
 use tonic::metadata::MetadataMap as TonicMeta;
 use tower::ServiceBuilder;
@@ -563,10 +564,16 @@ pub struct BytesEncoder {}
 impl Encoder for BytesEncoder {
     type Item = Bytes;
     type Error = TonicStatus;
+    type Encode = Ready<Result<EncodeBuffer, TonicStatus>>;
 
-    fn encode(&mut self, item: Self::Item, dst: &mut EncodeBuf<'_>) -> Result<(), Self::Error> {
-        dst.put_slice(&item);
-        Ok(())
+    fn encode(
+        self: Pin<&mut Self>,
+        item: Self::Item,
+        mut dst: EncodeBuffer,
+    ) -> Result<Self::Encode, Self::Error> {
+        let _ = self;
+        dst.as_encode_buf().put_slice(&item);
+        Ok(ready(Ok(dst)))
     }
 }
 
@@ -575,10 +582,16 @@ pub struct BufEncoder {}
 impl Encoder for BufEncoder {
     type Item = Box<dyn Buf + Send + Sync>;
     type Error = TonicStatus;
+    type Encode = Ready<Result<EncodeBuffer, TonicStatus>>;
 
-    fn encode(&mut self, mut item: Self::Item, dst: &mut EncodeBuf<'_>) -> Result<(), Self::Error> {
-        dst.put(&mut *item);
-        Ok(())
+    fn encode(
+        self: Pin<&mut Self>,
+        mut item: Self::Item,
+        mut dst: EncodeBuffer,
+    ) -> Result<Self::Encode, Self::Error> {
+        let _ = self;
+        dst.as_encode_buf().put(&mut *item);
+        Ok(ready(Ok(dst)))
     }
 }
 
@@ -588,11 +601,10 @@ pub struct BytesDecoder {}
 impl Decoder for BytesDecoder {
     type Item = Bytes;
     type Error = TonicStatus;
+    type Decode = Ready<Result<Option<Bytes>, TonicStatus>>;
 
-    fn decode(
-        &mut self,
-        src: &mut tonic::codec::DecodeBuf<'_>,
-    ) -> Result<Option<Self::Item>, Self::Error> {
-        Ok(Some(src.copy_to_bytes(src.remaining())))
+    fn decode(self: Pin<&mut Self>, mut src: DecodeBuf<'_>) -> Result<Self::Decode, Self::Error> {
+        let _ = self;
+        Ok(ready(Ok(Some(src.copy_to_bytes(src.remaining())))))
     }
 }

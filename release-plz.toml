@@ -22,6 +22,10 @@ name = "tonic-prost"
 version_group = "tonic"
 
 [[package]]
+name = "tonic-prost-async"
+version_group = "tonic"
+
+[[package]]
 name = "tonic-prost-build"
 version_group = "tonic"
 

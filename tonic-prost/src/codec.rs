@@ -1,7 +1,11 @@
 use prost::Message;
-use std::marker::PhantomData;
+use std::{
+    future::{Ready, ready},
+    marker::PhantomData,
+    pin::Pin,
+};
 use tonic::Status;
-use tonic::codec::{BufferSettings, Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
+use tonic::codec::{BufferSettings, Codec, DecodeBuf, Decoder, EncodeBuffer, Encoder};
 
 /// A [`Codec`] that implements `application/grpc+proto` via the prost library.
 #[derive(Debug, Clone)]
@@ -94,13 +98,25 @@ impl<T: Message> Encoder for ProstEncoder<T> {
     type Item = T;
     type Error = Status;
 
-    fn encode(&mut self, item: Self::Item, buf: &mut EncodeBuf<'_>) -> Result<(), Self::Error> {
-        item.encode(buf)
-            .expect("Message only errors if not enough space");
+    type Encode = Ready<Result<EncodeBuffer, Status>>;
 
-        Ok(())
+    #[inline]
+    fn encode(
+        self: Pin<&mut Self>,
+        item: Self::Item,
+        mut buf: EncodeBuffer,
+    ) -> Result<Self::Encode, Self::Error> {
+        let _ = self;
+        {
+            let mut dst = buf.as_encode_buf();
+            item.encode(&mut dst)
+                .expect("Message only errors if not enough space");
+        }
+
+        Ok(ready(Ok(buf)))
     }
 
+    #[inline]
     fn buffer_settings(&self) -> BufferSettings {
         self.buffer_settings
     }
@@ -123,16 +139,16 @@ impl<U> ProstDecoder<U> {
     }
 }
 
-impl<U: Message + Default> Decoder for ProstDecoder<U> {
+impl<U: Message + Default + Send + 'static> Decoder for ProstDecoder<U> {
     type Item = U;
     type Error = Status;
+    type Decode = Ready<Result<Option<U>, Status>>;
 
-    fn decode(&mut self, buf: &mut DecodeBuf<'_>) -> Result<Option<Self::Item>, Self::Error> {
-        let item = Message::decode(buf)
-            .map(Option::Some)
-            .map_err(from_decode_error)?;
+    fn decode(self: Pin<&mut Self>, buf: DecodeBuf<'_>) -> Result<Self::Decode, Self::Error> {
+        let _ = self;
+        let item = Message::decode(buf).map_err(from_decode_error)?;
 
-        Ok(item)
+        Ok(ready(Ok(Some(item))))
     }
 
     fn buffer_settings(&self) -> BufferSettings {
@@ -152,9 +168,13 @@ mod tests {
     use bytes::{Buf, BufMut, BytesMut};
     use http_body::Body;
     use http_body_util::BodyExt as _;
-    use std::pin::pin;
+    use std::{
+        future::Future,
+        pin::pin,
+        task::{Context, Poll},
+    };
     use tonic::codec::SingleMessageCompressionOverride;
-    use tonic::codec::{EncodeBody, HEADER_SIZE, Streaming};
+    use tonic::codec::{EncodeBody, EncodeBuffer, HEADER_SIZE, Streaming};
 
     const LEN: usize = 10000;
     // The maximum uncompressed size in bytes for a message. Set to 2MB.
@@ -184,6 +204,67 @@ mod tests {
             i += 1;
         }
         assert_eq!(i, 1);
+    }
+
+    #[tokio::test]
+    async fn decode_waits_for_async_decoder() {
+        let decoder = PendingDecoder::default();
+
+        let msg = vec![0u8; LEN];
+
+        let mut buf = BytesMut::new();
+
+        buf.reserve(msg.len() + HEADER_SIZE);
+        buf.put_u8(0);
+        buf.put_u32(msg.len() as u32);
+
+        buf.put(&msg[..]);
+
+        let body = body::MockBody::new(&buf[..], 10005, 0);
+
+        let mut stream = Streaming::new_request(decoder, body, None, None);
+
+        let output_msg = stream
+            .message()
+            .await
+            .expect("decode succeeds")
+            .expect("message is present");
+        assert_eq!(output_msg.len(), msg.len());
+        assert!(stream.message().await.expect("stream ends").is_none());
+    }
+
+    #[tokio::test]
+    async fn decode_async_decoder_returns_pending_before_message() {
+        let decoder = PendingDecoder::default();
+
+        let msg = vec![9u8; LEN];
+
+        let mut buf = BytesMut::new();
+        buf.reserve(msg.len() + HEADER_SIZE);
+        buf.put_u8(0);
+        buf.put_u32(msg.len() as u32);
+        buf.put(&msg[..]);
+
+        let body = body::MockBody::new(&buf[..], msg.len() + HEADER_SIZE, 0);
+        let mut stream = Streaming::new_request(decoder, body, None, None);
+        {
+            let mut message = pin!(stream.message());
+
+            let waker = std::task::Waker::noop();
+            let mut cx = Context::from_waker(waker);
+
+            assert!(matches!(message.as_mut().poll(&mut cx), Poll::Pending));
+
+            let output_msg = match message.as_mut().poll(&mut cx) {
+                Poll::Ready(Ok(Some(output_msg))) => output_msg,
+                Poll::Ready(Ok(None)) => panic!("message stream ended"),
+                Poll::Ready(Err(status)) => panic!("decode failed: {status}"),
+                Poll::Pending => panic!("decode remained pending"),
+            };
+
+            assert_eq!(output_msg, msg);
+        }
+        assert!(stream.message().await.expect("stream ends").is_none());
     }
 
     #[tokio::test]
@@ -236,6 +317,89 @@ mod tests {
         while let Some(r) = body.frame().await {
             r.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn encode_waits_for_async_encoder() {
+        let encoder = PendingEncoder::default();
+        let msg = Vec::from(&[7u8; 32][..]);
+
+        let messages = std::iter::once(Ok::<_, Status>(msg.clone()));
+        let source = tokio_stream::iter(messages);
+
+        let mut body = pin!(EncodeBody::new_server(
+            encoder,
+            source,
+            None,
+            SingleMessageCompressionOverride::default(),
+            None,
+        ));
+
+        let frame = body
+            .frame()
+            .await
+            .expect("at least one frame")
+            .expect("no error polling frame");
+        let data = frame.into_data().expect("got data frame");
+
+        assert_eq!(data[0], 0);
+        assert_eq!(
+            u32::from_be_bytes(data[1..HEADER_SIZE].try_into().unwrap()) as usize,
+            msg.len()
+        );
+        assert_eq!(&data[HEADER_SIZE..], &msg[..]);
+
+        let frame = body
+            .frame()
+            .await
+            .expect("trailers frame")
+            .expect("no error polling trailers");
+        assert_eq!(
+            frame
+                .into_trailers()
+                .expect("got trailers")
+                .get(Status::GRPC_STATUS)
+                .expect("grpc-status header"),
+            "0"
+        );
+        assert!(body.is_end_stream());
+    }
+
+    #[tokio::test]
+    async fn encode_async_encoder_returns_pending_before_data_frame() {
+        let encoder = PendingEncoder::default();
+        let msg = Vec::from(&[3u8; 32][..]);
+
+        let messages = std::iter::once(Ok::<_, Status>(msg.clone()));
+        let source = tokio_stream::iter(messages);
+
+        let mut body = pin!(EncodeBody::new_server(
+            encoder,
+            source,
+            None,
+            SingleMessageCompressionOverride::default(),
+            None,
+        ));
+
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
+
+        assert!(matches!(body.as_mut().poll_frame(&mut cx), Poll::Pending));
+
+        let frame = match body.as_mut().poll_frame(&mut cx) {
+            Poll::Ready(Some(Ok(frame))) => frame,
+            Poll::Ready(Some(Err(status))) => panic!("encode failed: {status}"),
+            Poll::Ready(None) => panic!("body ended"),
+            Poll::Pending => panic!("encode remained pending"),
+        };
+        let data = frame.into_data().expect("got data frame");
+
+        assert_eq!(data[0], 0);
+        assert_eq!(
+            u32::from_be_bytes(data[1..HEADER_SIZE].try_into().unwrap()) as usize,
+            msg.len()
+        );
+        assert_eq!(&data[HEADER_SIZE..], &msg[..]);
     }
 
     #[tokio::test]
@@ -312,14 +476,69 @@ mod tests {
     impl Encoder for MockEncoder {
         type Item = Vec<u8>;
         type Error = Status;
+        type Encode = Ready<Result<EncodeBuffer, Status>>;
 
-        fn encode(&mut self, item: Self::Item, buf: &mut EncodeBuf<'_>) -> Result<(), Self::Error> {
-            buf.put(&item[..]);
-            Ok(())
+        fn encode(
+            self: Pin<&mut Self>,
+            item: Self::Item,
+            mut buf: EncodeBuffer,
+        ) -> Result<Self::Encode, Self::Error> {
+            let _ = self;
+            buf.as_encode_buf().put(&item[..]);
+            Ok(ready(Ok(buf)))
         }
 
         fn buffer_settings(&self) -> BufferSettings {
             Default::default()
+        }
+    }
+
+    #[derive(Debug, Clone, Default)]
+    struct PendingEncoder;
+
+    #[derive(Debug)]
+    struct PendingEncode {
+        item: Vec<u8>,
+        buf: Option<EncodeBuffer>,
+        yielded: bool,
+    }
+
+    impl Encoder for PendingEncoder {
+        type Item = Vec<u8>;
+        type Error = Status;
+        type Encode = PendingEncode;
+
+        fn encode(
+            self: Pin<&mut Self>,
+            item: Self::Item,
+            buf: EncodeBuffer,
+        ) -> Result<Self::Encode, Self::Error> {
+            let _ = self;
+            Ok(PendingEncode {
+                item,
+                buf: Some(buf),
+                yielded: false,
+            })
+        }
+    }
+
+    impl Future for PendingEncode {
+        type Output = Result<EncodeBuffer, Status>;
+
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            let this = self.get_mut();
+            if !this.yielded {
+                this.yielded = true;
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+
+            let mut buf = this
+                .buf
+                .take()
+                .expect("pending encode polled after completion");
+            buf.as_encode_buf().put(&this.item[..]);
+            Poll::Ready(Ok(buf))
         }
     }
 
@@ -329,15 +548,67 @@ mod tests {
     impl Decoder for MockDecoder {
         type Item = Vec<u8>;
         type Error = Status;
+        type Decode = Ready<Result<Option<Vec<u8>>, Status>>;
 
-        fn decode(&mut self, buf: &mut DecodeBuf<'_>) -> Result<Option<Self::Item>, Self::Error> {
+        fn decode(
+            self: Pin<&mut Self>,
+            mut buf: DecodeBuf<'_>,
+        ) -> Result<Self::Decode, Self::Error> {
+            let _ = self;
             let out = Vec::from(buf.chunk());
             buf.advance(LEN);
-            Ok(Some(out))
+            Ok(ready(Ok(Some(out))))
         }
 
         fn buffer_settings(&self) -> BufferSettings {
             Default::default()
+        }
+    }
+
+    #[derive(Debug, Clone, Default)]
+    struct PendingDecoder;
+
+    #[derive(Debug)]
+    struct PendingDecode {
+        item: Option<Vec<u8>>,
+        yielded: bool,
+    }
+
+    impl Decoder for PendingDecoder {
+        type Item = Vec<u8>;
+        type Error = Status;
+        type Decode = PendingDecode;
+
+        fn decode(
+            self: Pin<&mut Self>,
+            mut buf: DecodeBuf<'_>,
+        ) -> Result<Self::Decode, Self::Error> {
+            let _ = self;
+            let out = Vec::from(buf.chunk());
+            buf.advance(LEN);
+            Ok(PendingDecode {
+                item: Some(out),
+                yielded: false,
+            })
+        }
+    }
+
+    impl Future for PendingDecode {
+        type Output = Result<Option<Vec<u8>>, Status>;
+
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            let this = self.get_mut();
+            if !this.yielded {
+                this.yielded = true;
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+
+            Poll::Ready(Ok(Some(
+                this.item
+                    .take()
+                    .expect("pending decode polled after completion"),
+            )))
         }
     }
 

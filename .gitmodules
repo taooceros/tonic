@@ -1,0 +1,3 @@
+[submodule "prost"]
+	path = prost
+	url = https://github.com/taooceros/prost.git

@@ -7,12 +7,12 @@ pub(crate) mod compression;
 mod decode;
 mod encode;
 use crate::Status;
-use std::io;
+use std::{future::Future, io, pin::Pin};
 
-pub use self::buffer::{DecodeBuf, EncodeBuf};
+pub use self::buffer::{DecodeBuf, EncodeBuf, EncodeBuffer};
 pub use self::compression::{CompressionEncoding, EnabledCompressionEncodings};
 pub use self::decode::Streaming;
-pub use self::encode::EncodeBody;
+pub use self::encode::{EncodeBody, EncodedBytes};
 
 // Doc hidden since this is used in a test in another crate, we can expose this publically later
 // if we need it.
@@ -119,7 +119,7 @@ pub trait Codec {
     fn decoder(&mut self) -> Self::Decoder;
 }
 
-/// Encodes gRPC message types
+/// Encodes gRPC message types.
 pub trait Encoder {
     /// The type that is encoded.
     type Item;
@@ -129,8 +129,20 @@ pub trait Encoder {
     /// The type of unrecoverable frame encoding errors.
     type Error: From<io::Error>;
 
-    /// Encodes a message into the provided buffer.
-    fn encode(&mut self, item: Self::Item, dst: &mut EncodeBuf<'_>) -> Result<(), Self::Error>;
+    /// The owned future that completes one message encode.
+    type Encode: Future<Output = Result<EncodeBuffer, Self::Error>> + Send + 'static;
+
+    /// Starts encoding one message into owned encode storage.
+    ///
+    /// Synchronous encoders should write the payload immediately and return a
+    /// ready future. Asynchronous encoders should return an owned future that
+    /// keeps all item, buffer, and cancellation state until it returns the
+    /// completed buffer.
+    fn encode(
+        self: Pin<&mut Self>,
+        item: Self::Item,
+        dst: EncodeBuffer,
+    ) -> Result<Self::Encode, Self::Error>;
 
     /// Controls how tonic creates and expands encode buffers.
     fn buffer_settings(&self) -> BufferSettings {
@@ -138,7 +150,7 @@ pub trait Encoder {
     }
 }
 
-/// Decodes gRPC message types
+/// Decodes gRPC message types.
 pub trait Decoder {
     /// The type that is decoded.
     type Item;
@@ -146,12 +158,16 @@ pub trait Decoder {
     /// The type of unrecoverable frame decoding errors.
     type Error: From<io::Error>;
 
-    /// Decode a message from the buffer.
+    /// The owned future that completes one message decode.
+    type Decode: Future<Output = Result<Option<Self::Item>, Self::Error>> + Send + 'static;
+
+    /// Starts decoding one full message from the provided buffer.
     ///
-    /// The buffer will contain exactly the bytes of a full message. There
-    /// is no need to get the length from the bytes, gRPC framing is handled
-    /// for you.
-    fn decode(&mut self, src: &mut DecodeBuf<'_>) -> Result<Option<Self::Item>, Self::Error>;
+    /// The buffer contains exactly the bytes of a full message. Decoders that
+    /// complete immediately can return any ready future. Asynchronous decoders
+    /// should copy or otherwise move the message bytes into an owned operation
+    /// before returning.
+    fn decode(self: Pin<&mut Self>, src: DecodeBuf<'_>) -> Result<Self::Decode, Self::Error>;
 
     /// Controls how tonic creates and expands decode buffers.
     fn buffer_settings(&self) -> BufferSettings {

@@ -1,0 +1,23 @@
+syntax = "proto3";
+
+package customized.integration.bench;
+
+message NestedPayload {
+  uint32 id = 1;
+  string label = 2;
+  bytes payload = 3;
+}
+
+message PayloadShape {
+  uint32 scalar = 1;
+  uint64 sequence = 2;
+  bool enabled = 3;
+  string large_string = 4;
+  bytes large_bytes = 5;
+  repeated string repeated_strings = 6;
+  repeated bytes repeated_bytes = 7;
+  NestedPayload nested = 8;
+  repeated NestedPayload repeated_nested = 9;
+  map<string, string> string_map = 10;
+  map<string, bytes> bytes_map = 11;
+}

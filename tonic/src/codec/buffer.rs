@@ -8,10 +8,18 @@ pub struct DecodeBuf<'a> {
     len: usize,
 }
 
+/// Owned encode storage for one in-flight message.
+#[derive(Debug)]
+pub struct EncodeBuffer {
+    buf: BytesMut,
+    requires_stable_storage: bool,
+}
+
 /// A specialized buffer to encode gRPC messages into.
 #[derive(Debug)]
 pub struct EncodeBuf<'a> {
     buf: &'a mut BytesMut,
+    requires_stable_storage: Option<&'a mut bool>,
 }
 
 impl<'a> DecodeBuf<'a> {
@@ -51,10 +59,40 @@ impl Buf for DecodeBuf<'_> {
         self.buf.copy_to_bytes(len)
     }
 }
+impl EncodeBuffer {
+    pub(crate) fn new(buf: BytesMut) -> Self {
+        Self {
+            buf,
+            requires_stable_storage: false,
+        }
+    }
+
+    pub(crate) fn into_inner(self) -> BytesMut {
+        self.buf
+    }
+
+    #[doc(hidden)]
+    pub fn as_encode_buf(&mut self) -> EncodeBuf<'_> {
+        EncodeBuf::new_with_stable_storage_flag(&mut self.buf, &mut self.requires_stable_storage)
+    }
+
+    /// Returns true when an encoder has retained a pointer into this storage
+    /// across a pending encode operation.
+    #[inline]
+    pub fn requires_stable_storage(&self) -> bool {
+        self.requires_stable_storage
+    }
+}
 
 impl<'a> EncodeBuf<'a> {
-    pub(crate) fn new(buf: &'a mut BytesMut) -> Self {
-        EncodeBuf { buf }
+    pub(crate) fn new_with_stable_storage_flag(
+        buf: &'a mut BytesMut,
+        requires_stable_storage: &'a mut bool,
+    ) -> Self {
+        EncodeBuf {
+            buf,
+            requires_stable_storage: Some(requires_stable_storage),
+        }
     }
 }
 
@@ -67,6 +105,91 @@ impl EncodeBuf<'_> {
     #[inline]
     pub fn reserve(&mut self, additional: usize) {
         self.buf.reserve(additional);
+    }
+    /// Reserves `len` bytes of spare capacity and lets the caller initialize it.
+    ///
+    /// The readable length is advanced only if `write` returns `Ok(())`.
+    ///
+    /// # Safety
+    ///
+    /// `write` must initialize exactly `len` bytes at the provided pointer before
+    /// returning `Ok(())`. It must not read from the pointer, retain the pointer,
+    /// or return before any external writer using the pointer has completed.
+    #[doc(hidden)]
+    #[inline]
+    pub unsafe fn put_uninit_slice_with<E>(
+        &mut self,
+        len: usize,
+        write: impl FnOnce(*mut u8) -> Result<(), E>,
+    ) -> Result<(), E> {
+        if len == 0 {
+            return write(std::ptr::NonNull::<u8>::dangling().as_ptr());
+        }
+
+        self.buf.reserve(len);
+        let chunk = self.buf.chunk_mut();
+        assert!(chunk.len() >= len);
+        let dst = chunk.as_mut_ptr();
+
+        write(dst)?;
+
+        // SAFETY: The caller guarantees that `write` initialized exactly `len`
+        // bytes at `dst` before returning `Ok(())`.
+        unsafe {
+            self.buf.advance_mut(len);
+        }
+
+        Ok(())
+    }
+
+    /// Reserves `len` bytes of spare capacity for initialization that may finish
+    /// after the current poll returns.
+    ///
+    /// This is an experimental low-level hook for codecs that hand the returned
+    /// pointer to an external asynchronous writer. The readable length is not
+    /// advanced; after the writer has initialized the bytes, the caller must
+    /// complete the operation with [`EncodeBuf::advance_reserved_uninit_slice`].
+    ///
+    /// # Safety
+    ///
+    /// The caller must initialize exactly `len` bytes at the returned pointer
+    /// before calling [`EncodeBuf::advance_reserved_uninit_slice`]. While the
+    /// pointer is retained, the owner of this `EncodeBuf` must not perform any
+    /// operation that can reallocate, split, or otherwise move the buffer storage.
+    /// The pointer must not be used after the matching advance call.
+    #[doc(hidden)]
+    #[inline]
+    pub unsafe fn reserve_uninit_slice_for_pending(&mut self, len: usize) -> *mut u8 {
+        if let Some(requires_stable_storage) = &mut self.requires_stable_storage {
+            **requires_stable_storage = true;
+        }
+
+        if len == 0 {
+            return std::ptr::NonNull::<u8>::dangling().as_ptr();
+        }
+
+        self.buf.reserve(len);
+        let chunk = self.buf.chunk_mut();
+        assert!(chunk.len() >= len);
+        chunk.as_mut_ptr()
+    }
+
+    /// Advances the readable length for bytes initialized after
+    /// [`EncodeBuf::reserve_uninit_slice_for_pending`].
+    ///
+    /// # Safety
+    ///
+    /// The caller must have initialized exactly `len` bytes from the most recent
+    /// matching pending reservation, and must call this at most once for that
+    /// reservation.
+    #[doc(hidden)]
+    #[inline]
+    pub unsafe fn advance_reserved_uninit_slice(&mut self, len: usize) {
+        // SAFETY: The caller guarantees that the matching pending reservation
+        // initialized exactly `len` bytes and has not already been advanced.
+        unsafe {
+            self.buf.advance_mut(len);
+        }
     }
 }
 
@@ -133,8 +256,8 @@ mod tests {
 
     #[test]
     fn encode_buf() {
-        let mut bytes = BytesMut::with_capacity(100);
-        let mut buf = EncodeBuf::new(&mut bytes);
+        let mut storage = EncodeBuffer::new(BytesMut::with_capacity(100));
+        let mut buf = storage.as_encode_buf();
 
         let initial = buf.remaining_mut();
         unsafe { buf.advance_mut(20) };
@@ -142,5 +265,56 @@ mod tests {
 
         buf.put_u8(b'a');
         assert_eq!(buf.remaining_mut(), initial - 20 - 1);
+    }
+
+    #[test]
+    fn encode_buf_put_uninit_slice_with_advances_only_on_success() {
+        let mut storage = EncodeBuffer::new(BytesMut::with_capacity(16));
+        let mut buf = storage.as_encode_buf();
+
+        // SAFETY: The closure initializes exactly the requested 3 bytes and
+        // returns success, so advancing the readable length is valid.
+        unsafe {
+            buf.put_uninit_slice_with(3, |dst| {
+                std::ptr::copy_nonoverlapping(b"abc".as_ptr(), dst, 3);
+                Ok::<_, ()>(())
+            })
+            .expect("write succeeds");
+        }
+        assert_eq!(&buf.buf[..], b"abc");
+
+        // SAFETY: The closure writes within the requested 3-byte range but
+        // returns an error, so the readable length must not advance.
+        unsafe {
+            let err = buf
+                .put_uninit_slice_with(3, |dst| {
+                    std::ptr::copy_nonoverlapping(b"def".as_ptr(), dst, 3);
+                    Err::<(), _>("fail")
+                })
+                .expect_err("write fails");
+            assert_eq!(err, "fail");
+        }
+        assert_eq!(&buf.buf[..], b"abc");
+    }
+
+    #[test]
+    fn encode_buf_pending_reservation_advances_on_explicit_commit() {
+        let mut bytes = BytesMut::with_capacity(16);
+        let mut requires_stable_storage = false;
+        let mut buf =
+            EncodeBuf::new_with_stable_storage_flag(&mut bytes, &mut requires_stable_storage);
+
+        // SAFETY: The test initializes exactly the reserved 3 bytes and then
+        // commits those same bytes once.
+        unsafe {
+            let dst = buf.reserve_uninit_slice_for_pending(3);
+            std::ptr::copy_nonoverlapping(b"abc".as_ptr(), dst, 3);
+            assert!(buf.buf.is_empty());
+            buf.advance_reserved_uninit_slice(3);
+        }
+
+        assert_eq!(&buf.buf[..], b"abc");
+        drop(buf);
+        assert!(requires_stable_storage);
     }
 }

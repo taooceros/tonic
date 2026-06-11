@@ -1,0 +1,23 @@
+# Decode benchmark baseline
+
+Source:
+- Branch/ref: origin/master
+- Commit: 4687108 grpc/lb: add subchannel attribute API (#2672)
+- Command: cargo bench -p tonic --bench decode
+- Machine: Intel Xeon Gold 6438M, Linux x86_64
+- Date observed: 2026-06-07
+
+Results:
+
+```text
+running 9 tests
+test chunk_size_100   ... bench:         973 ns/iter (+/- 110) = 1032 MB/s
+test chunk_size_1005  ... bench:         365 ns/iter (+/- 107) = 2753 MB/s
+test chunk_size_500   ... bench:         494 ns/iter (+/- 115) = 2034 MB/s
+test message_count_1  ... bench:         365 ns/iter (+/- 12) = 1383 MB/s
+test message_count_10 ... bench:       1,316 ns/iter (+/- 47) = 3837 MB/s
+test message_count_20 ... bench:       2,483 ns/iter (+/- 101) = 4067 MB/s
+test message_size_10k ... bench:       2,189 ns/iter (+/- 137) = 9141 MB/s
+test message_size_1k  ... bench:         472 ns/iter (+/- 15) = 4258 MB/s
+test message_size_5k  ... bench:       1,205 ns/iter (+/- 40) = 8307 MB/s
+```
